@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime outputs
+outputs/
+runs/
+
+# Bundled upstream demo weights can exceed GitHub's 100 MB file limit.
+# Keep application weights in models/ instead.
+ultralytics/ultralytics/weights/*.pt
+
+# Local IDE/editor files
+.idea/
+.vscode/
+
+# Environment folders
+.venv/
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
