@@ -28,11 +28,13 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -47,6 +49,7 @@ from core.detection_worker import DetectionWorker
 from core.history_store import HistoryStore
 from core.models import DetectionConfig, FrameResult, SourceSpec, iter_supported_media
 from core.review_dataset import build_labelimg_args, export_review_sample, resolve_labelimg_executable
+from core.weight_registry import WeightRegistryStore
 from ui.theme import APP_QSS
 
 
@@ -54,6 +57,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = PROJECT_ROOT / "config"
 MODELS_DIR = PROJECT_ROOT / "models"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
+MODEL_WEIGHT_REGISTRY = CONFIG_DIR / "model_weights.json"
 
 
 @dataclass
@@ -250,6 +254,472 @@ class ReviewIssueDialog(QDialog):
         return self.note_edit.toPlainText().strip()
 
 
+class WeightMetadataDialog(QDialog):
+    def __init__(self, record: Dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("编辑权重备注")
+        self.resize(520, 360)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        layout.addWidget(QLabel("显示名称"))
+        self.display_name_edit = QLineEdit(str(record.get("display_name") or record.get("model_name", "")))
+        layout.addWidget(self.display_name_edit)
+
+        layout.addWidget(QLabel("推荐用途"))
+        self.recommended_edit = QLineEdit(str(record.get("recommended_for", "")))
+        self.recommended_edit.setPlaceholderText("例如：TT100K 交通标志、小目标检测、夜间场景")
+        layout.addWidget(self.recommended_edit)
+
+        layout.addWidget(QLabel("标签"))
+        self.tags_edit = QLineEdit(str(record.get("tags", "")))
+        self.tags_edit.setPlaceholderText("例如：tt100k, yolo26, high-recall")
+        layout.addWidget(self.tags_edit)
+
+        layout.addWidget(QLabel("备注"))
+        self.notes_edit = QPlainTextEdit()
+        self.notes_edit.setPlainText(str(record.get("notes", "")))
+        self.notes_edit.setPlaceholderText("记录训练策略、适用场景、已知问题或选择建议")
+        layout.addWidget(self.notes_edit, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> Dict[str, str]:
+        return {
+            "display_name": self.display_name_edit.text().strip(),
+            "recommended_for": self.recommended_edit.text().strip(),
+            "tags": self.tags_edit.text().strip(),
+            "notes": self.notes_edit.toPlainText().strip(),
+        }
+
+
+class ArtifactPreview(QLabel):
+    def __init__(self, title: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.title = title
+        self.path = ""
+        self._zoom_callback = None
+        self.setObjectName("ImageView")
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(QSize(180, 120))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setWordWrap(True)
+
+    def set_artifact(self, path: str, zoom_callback) -> None:
+        self.path = path or ""
+        self._zoom_callback = zoom_callback
+        if not self.path or not Path(self.path).exists():
+            self.setPixmap(QPixmap())
+            self.setText(f"{self.title}\n未生成")
+            self.setCursor(Qt.ArrowCursor)
+            return
+        pixmap = QPixmap(self.path)
+        if pixmap.isNull():
+            self.setPixmap(QPixmap())
+            self.setText(f"{self.title}\n无法预览")
+            self.setCursor(Qt.ArrowCursor)
+            return
+        self.setText("")
+        self.setPixmap(
+            pixmap.scaled(
+                max(1, self.width() - 10),
+                max(1, self.height() - 10),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(self.path)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.path:
+            self.set_artifact(self.path, self._zoom_callback)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.path and self._zoom_callback:
+            self._zoom_callback(self.title, self.path)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class WeightManagerDialog(QDialog):
+    IMAGE_FIELDS = [
+        ("训练曲线", "results_png"),
+        ("PR 曲线", "pr_curve"),
+        ("F1 曲线", "f1_curve"),
+        ("Precision 曲线", "precision_curve"),
+        ("Recall 曲线", "recall_curve"),
+        ("混淆矩阵", "confusion_matrix"),
+        ("归一化混淆矩阵", "confusion_matrix_normalized"),
+    ]
+
+    def __init__(
+        self,
+        store: WeightRegistryStore,
+        models_dir: Path,
+        project_root: Path,
+        apply_callback,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.store = store
+        self.models_dir = models_dir
+        self.project_root = project_root
+        self.apply_callback = apply_callback
+        self.records: List[Dict] = []
+        self._artifact_widgets: Dict[str, ArtifactPreview] = {}
+        self._detail_labels: Dict[str, QLabel] = {}
+
+        self.setWindowTitle("模型权重管理")
+        self.resize(1180, 720)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_table_panel())
+        splitter.addWidget(self._build_detail_panel())
+        splitter.setSizes([620, 560])
+        layout.addWidget(splitter, 1)
+
+        self._refresh_records()
+
+    def _build_table_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.weight_table = QTableWidget(0, 8)
+        self.weight_table.setHorizontalHeaderLabels(
+            ["权重", "训练名", "数据集", "mAP50", "mAP50-95", "Precision", "Recall", "推荐用途"]
+        )
+        self.weight_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.weight_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.weight_table.verticalHeader().setVisible(False)
+        self.weight_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.weight_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.weight_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.weight_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.weight_table.currentCellChanged.connect(self._on_selection_changed)
+        layout.addWidget(self.weight_table, 1)
+
+        row_one = QHBoxLayout()
+        import_btn = QPushButton("导入训练目录")
+        import_btn.clicked.connect(self._import_training_run)
+        associate_btn = QPushButton("手动关联权重")
+        associate_btn.clicked.connect(self._associate_weight)
+        edit_btn = QPushButton("编辑备注/用途")
+        edit_btn.clicked.connect(self._edit_metadata)
+        refresh_btn = QPushButton("刷新指标")
+        refresh_btn.clicked.connect(self._refresh_metrics)
+        remove_btn = QPushButton("删除导入记录")
+        remove_btn.setObjectName("DangerButton")
+        remove_btn.clicked.connect(self._remove_selected_record)
+        row_one.addWidget(import_btn)
+        row_one.addWidget(associate_btn)
+        row_one.addWidget(edit_btn)
+        row_one.addWidget(refresh_btn)
+        row_one.addWidget(remove_btn)
+        layout.addLayout(row_one)
+
+        row_two = QHBoxLayout()
+        apply_btn = QPushButton("应用为当前权重")
+        apply_btn.setObjectName("PrimaryButton")
+        apply_btn.clicked.connect(self._apply_selected_weight)
+        open_btn = QPushButton("打开训练目录")
+        open_btn.clicked.connect(self._open_training_dir)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        row_two.addWidget(apply_btn)
+        row_two.addWidget(open_btn)
+        row_two.addStretch(1)
+        row_two.addWidget(close_btn)
+        layout.addLayout(row_two)
+        return panel
+
+    def _build_detail_panel(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 0, 0, 0)
+        layout.setSpacing(10)
+
+        summary = QFrame()
+        summary.setObjectName("Panel")
+        summary_layout = QGridLayout(summary)
+        summary_layout.setContentsMargins(14, 14, 14, 14)
+        summary_layout.setHorizontalSpacing(12)
+        summary_layout.setVerticalSpacing(8)
+        fields = [
+            ("权重", "model_name"),
+            ("显示名称", "display_name"),
+            ("训练目录", "training_name"),
+            ("数据集", "dataset"),
+            ("基础模型", "base_model"),
+            ("最佳 epoch", "best_epoch"),
+            ("mAP50", "best_map50"),
+            ("mAP50-95", "best_map5095"),
+            ("Precision", "best_precision"),
+            ("Recall", "best_recall"),
+            ("训练参数", "train_args"),
+            ("推荐用途", "recommended_for"),
+            ("标签", "tags"),
+        ]
+        for index, (title, key) in enumerate(fields):
+            title_label = QLabel(title)
+            title_label.setObjectName("Muted")
+            value_label = QLabel("--")
+            value_label.setWordWrap(True)
+            self._detail_labels[key] = value_label
+            row = index // 2
+            col = (index % 2) * 2
+            summary_layout.addWidget(title_label, row, col)
+            summary_layout.addWidget(value_label, row, col + 1)
+        layout.addWidget(summary)
+
+        layout.addWidget(QLabel("备注"))
+        self.notes_view = QPlainTextEdit()
+        self.notes_view.setReadOnly(True)
+        self.notes_view.setMinimumHeight(90)
+        layout.addWidget(self.notes_view)
+
+        images = QFrame()
+        images.setObjectName("Panel")
+        image_grid = QGridLayout(images)
+        image_grid.setContentsMargins(14, 14, 14, 14)
+        image_grid.setHorizontalSpacing(10)
+        image_grid.setVerticalSpacing(10)
+        for index, (title, key) in enumerate(self.IMAGE_FIELDS):
+            preview = ArtifactPreview(title)
+            self._artifact_widgets[key] = preview
+            image_grid.addWidget(preview, index // 2, index % 2)
+        layout.addWidget(images)
+        layout.addStretch(1)
+
+        scroll.setWidget(container)
+        return scroll
+
+    def _refresh_records(self, select_model: str | None = None) -> None:
+        current = select_model or self._current_model_name()
+        hidden_models = self.store.hidden_model_names()
+        records_by_model = {record.get("model_name"): dict(record) for record in self.store.load()}
+        self.models_dir.mkdir(exist_ok=True)
+        for model_path in sorted(self.models_dir.glob("*.pt"), key=lambda path: path.name.lower()):
+            if model_path.name in hidden_models:
+                continue
+            if model_path.name not in records_by_model:
+                records_by_model[model_path.name] = {
+                    "model_name": model_path.name,
+                    "model_path": str(model_path.resolve()),
+                    "display_name": model_path.stem,
+                    "training_name": "",
+                    "training_dir": "",
+                    "dataset": "",
+                    "base_model": "",
+                    "metrics": {},
+                    "artifacts": {},
+                    "recommended_for": "",
+                    "tags": "",
+                    "notes": "",
+                }
+
+        self.records = sorted(
+            records_by_model.values(),
+            key=lambda record: str(record.get("display_name") or record.get("model_name", "")).lower(),
+        )
+        self.weight_table.setRowCount(len(self.records))
+        selected_row = 0
+        for row, record in enumerate(self.records):
+            metrics = record.get("metrics") or {}
+            values = [
+                record.get("model_name", ""),
+                record.get("training_name", ""),
+                record.get("dataset", ""),
+                self._format_metric(metrics.get("best_map50")),
+                self._format_metric(metrics.get("best_map5095")),
+                self._format_metric(metrics.get("best_precision")),
+                self._format_metric(metrics.get("best_recall")),
+                record.get("recommended_for", ""),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if col in {0, 2, 7}:
+                    item.setToolTip(str(value))
+                self.weight_table.setItem(row, col, item)
+            if current and record.get("model_name") == current:
+                selected_row = row
+
+        if self.records:
+            self.weight_table.selectRow(selected_row)
+            self._show_record(self.records[selected_row])
+        else:
+            self._show_record({})
+
+    def _on_selection_changed(self, current_row: int, _current_col: int, _previous_row: int, _previous_col: int) -> None:
+        if 0 <= current_row < len(self.records):
+            self._show_record(self.records[current_row])
+
+    def _current_record(self) -> Dict:
+        row = self.weight_table.currentRow()
+        if 0 <= row < len(self.records):
+            return self.records[row]
+        return {}
+
+    def _current_model_name(self) -> str:
+        record = self._current_record()
+        return str(record.get("model_name", ""))
+
+    def _show_record(self, record: Dict) -> None:
+        metrics = record.get("metrics") or {}
+        self._detail_labels["model_name"].setText(str(record.get("model_name", "--") or "--"))
+        self._detail_labels["display_name"].setText(str(record.get("display_name", "--") or "--"))
+        self._detail_labels["training_name"].setText(str(record.get("training_name", "--") or "--"))
+        self._detail_labels["dataset"].setText(str(record.get("dataset", "--") or "--"))
+        self._detail_labels["base_model"].setText(str(record.get("base_model", "--") or "--"))
+        self._detail_labels["best_epoch"].setText(str(metrics.get("best_epoch", "--") or "--"))
+        self._detail_labels["best_map50"].setText(self._format_metric(metrics.get("best_map50")))
+        self._detail_labels["best_map5095"].setText(self._format_metric(metrics.get("best_map5095")))
+        self._detail_labels["best_precision"].setText(self._format_metric(metrics.get("best_precision")))
+        self._detail_labels["best_recall"].setText(self._format_metric(metrics.get("best_recall")))
+        args_text = f"epochs={record.get('epochs', '')}, imgsz={record.get('imgsz', '')}, batch={record.get('batch', '')}"
+        self._detail_labels["train_args"].setText(args_text.strip(", "))
+        self._detail_labels["recommended_for"].setText(str(record.get("recommended_for", "--") or "--"))
+        self._detail_labels["tags"].setText(str(record.get("tags", "--") or "--"))
+        self.notes_view.setPlainText(str(record.get("notes", "")))
+
+        artifacts = record.get("artifacts") or {}
+        for _title, key in self.IMAGE_FIELDS:
+            self._artifact_widgets[key].set_artifact(str(artifacts.get(key, "")), self._open_artifact_zoom)
+
+    def _import_training_run(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择 YOLO 训练输出目录", str(self.project_root.parent))
+        if not folder:
+            return
+        try:
+            record = self.store.import_training_run(folder, self.models_dir)
+        except Exception as exc:
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        self._refresh_records(record.get("model_name", ""))
+        QMessageBox.information(self, "导入完成", f"已导入权重：{record.get('model_name', '')}")
+
+    def _associate_weight(self) -> None:
+        record = self._current_record()
+        default_weight = str(record.get("model_path", "")) if record else ""
+        open_dir = str(Path(default_weight).parent) if default_weight and Path(default_weight).exists() else str(self.models_dir)
+        model_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择要关联的权重",
+            open_dir,
+            "YOLO weights (*.pt)",
+        )
+        if not model_path:
+            return
+
+        folder = QFileDialog.getExistingDirectory(self, "选择该权重对应的训练输出目录", str(self.project_root.parent))
+        if not folder:
+            return
+        try:
+            updated = self.store.register_training_run(folder, model_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "关联失败", str(exc))
+            return
+        self._refresh_records(updated.get("model_name", ""))
+
+    def _edit_metadata(self) -> None:
+        record = self._current_record()
+        if not record:
+            return
+        dialog = WeightMetadataDialog(record, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        updated = dict(record)
+        updated.update(dialog.values())
+        updated["display_name"] = updated.get("display_name") or updated.get("model_name", "")
+        updated.setdefault("metrics", {})
+        updated.setdefault("artifacts", {})
+        saved = self.store.upsert(updated)
+        self._refresh_records(saved.get("model_name", ""))
+
+    def _remove_selected_record(self) -> None:
+        record = self._current_record()
+        model_name = str(record.get("model_name", ""))
+        if not model_name:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "删除导入记录",
+            f"确定从权重管理中删除「{model_name}」吗？\n\n本地 .pt 权重文件不会被删除，之后仍可通过“手动关联权重”或“导入训练目录”重新加入。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.store.remove_from_manager(model_name)
+        self._refresh_records()
+
+    def _refresh_metrics(self) -> None:
+        record = self._current_record()
+        model_name = str(record.get("model_name", ""))
+        if not model_name:
+            return
+        try:
+            refreshed = self.store.refresh(model_name)
+        except Exception as exc:
+            QMessageBox.warning(self, "刷新失败", str(exc))
+            return
+        self._refresh_records(refreshed.get("model_name", ""))
+
+    def _apply_selected_weight(self) -> None:
+        record = self._current_record()
+        model_name = str(record.get("model_name", ""))
+        if not model_name:
+            return
+        model_path = Path(str(record.get("model_path") or self.models_dir / model_name))
+        if not model_path.exists() and (self.models_dir / model_name).exists():
+            model_path = self.models_dir / model_name
+        if not model_path.exists():
+            QMessageBox.warning(self, "权重不存在", f"找不到权重文件：{model_path}")
+            return
+        self.apply_callback(model_name)
+        QMessageBox.information(self, "已应用", f"当前检测权重已切换为：{model_name}")
+
+    def _open_training_dir(self) -> None:
+        record = self._current_record()
+        training_dir = str(record.get("training_dir", ""))
+        if not training_dir or not Path(training_dir).exists():
+            QMessageBox.information(self, "没有训练目录", "当前权重还没有关联训练输出目录。")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(training_dir))
+
+    def _open_artifact_zoom(self, title: str, path: str) -> None:
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return
+        dialog = ImageZoomDialog(title, pixmap, self)
+        dialog.exec()
+
+    @staticmethod
+    def _format_metric(value) -> str:
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return "--"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -259,6 +729,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(APP_QSS)
 
         self.history_store = HistoryStore(OUTPUT_DIR)
+        self.weight_store = WeightRegistryStore(MODEL_WEIGHT_REGISTRY)
         self.source: Optional[SourceSpec] = None
         self.worker: Optional[DetectionWorker] = None
         self.worker_thread: Optional[QThread] = None
@@ -449,6 +920,9 @@ class MainWindow(QMainWindow):
         self.model_combo.currentTextChanged.connect(self._on_model_changed)
         layout.addWidget(QLabel("模型权重"))
         layout.addWidget(self.model_combo)
+        self.weight_manager_btn = QPushButton("权重管理")
+        self.weight_manager_btn.clicked.connect(self._open_weight_manager)
+        layout.addWidget(self.weight_manager_btn)
 
         self.conf_spin = QDoubleSpinBox()
         self.conf_spin.setRange(0.01, 1.00)
@@ -569,17 +1043,30 @@ class MainWindow(QMainWindow):
 
     def _load_models(self) -> None:
         MODELS_DIR.mkdir(exist_ok=True)
+        current_model = self.model_combo.currentText() if hasattr(self, "model_combo") else ""
+        hidden_models = self.weight_store.hidden_model_names()
         models = sorted(
-            [path for path in MODELS_DIR.iterdir() if path.suffix.lower() == ".pt"],
+            [
+                path
+                for path in MODELS_DIR.iterdir()
+                if path.suffix.lower() == ".pt" and path.name not in hidden_models
+            ],
             key=lambda path: path.stat().st_size,
         )
         self.model_combo.clear()
         self.model_combo.addItems([path.name for path in models])
         if models:
-            self.model_card_value.setText(models[0].name)
+            selected = current_model if current_model in [path.name for path in models] else models[0].name
+            self._select_model_by_name(selected)
         else:
             self.model_card_value.setText("未找到")
             self._set_status("models 目录下没有 .pt 权重文件")
+
+    def _select_model_by_name(self, model_name: str) -> None:
+        index = self.model_combo.findText(model_name)
+        if index >= 0:
+            self.model_combo.setCurrentIndex(index)
+            self.model_card_value.setText(model_name)
 
     def _load_settings(self) -> None:
         config = self._read_json(CONFIG_DIR / "setting.json", {})
@@ -727,6 +1214,22 @@ class MainWindow(QMainWindow):
             save_results=self.save_result_check.isChecked(),
             save_txt=self.save_txt_check.isChecked(),
         )
+
+    def _open_weight_manager(self) -> None:
+        dialog = WeightManagerDialog(
+            self.weight_store,
+            MODELS_DIR,
+            PROJECT_ROOT,
+            self._apply_model_from_manager,
+            self,
+        )
+        dialog.exec()
+        self._load_models()
+
+    def _apply_model_from_manager(self, model_name: str) -> None:
+        self._load_models()
+        self._select_model_by_name(model_name)
+        self._set_status(f"已切换模型权重：{model_name}")
 
     def _on_model_changed(self, model_name: str) -> None:
         self.model_card_value.setText(model_name or "--")
@@ -951,6 +1454,7 @@ class MainWindow(QMainWindow):
             self.camera_btn,
             self.stream_btn,
             self.model_combo,
+            self.weight_manager_btn,
             self.save_result_check,
             self.save_txt_check,
         ):
@@ -969,6 +1473,7 @@ class MainWindow(QMainWindow):
             self.camera_btn,
             self.stream_btn,
             self.model_combo,
+            self.weight_manager_btn,
             self.save_result_check,
             self.save_txt_check,
         ):
