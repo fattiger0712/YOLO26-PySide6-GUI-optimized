@@ -4,7 +4,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from core.weight_registry import WeightRegistryStore, build_training_record
+from core.weight_registry import WeightRegistryStore, build_training_record, ensure_training_run_weights
 
 
 class WeightRegistryTest(unittest.TestCase):
@@ -116,6 +116,16 @@ class WeightRegistryTest(unittest.TestCase):
         self.assertFalse(restored.get("removed_from_manager", False))
         self.assertEqual(store.hidden_model_names(), set())
         self.assertEqual(len(store.load()), 1)
+
+    def test_ensure_training_run_weights_imports_runs_into_models_dir(self):
+        store = WeightRegistryStore(self.root / "model_weights.json")
+
+        imported = ensure_training_run_weights(store, self.models_dir, [self.root / "runs"])
+
+        self.assertEqual(len(imported), 1)
+        self.assertTrue((self.models_dir / "tt100k_demo_best.pt").exists())
+        self.assertEqual(store.load()[0]["model_name"], "tt100k_demo_best.pt")
+        self.assertEqual(Path(store.load()[0]["model_path"]), self.models_dir / "tt100k_demo_best.pt")
 
 
 if __name__ == "__main__":

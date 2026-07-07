@@ -1,10 +1,10 @@
 [
   {
     "model_name": "tt100k_yolo26s_best.pt",
-    "model_path": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\models\\tt100k_yolo26s_best.pt",
+    "model_path": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized-main\\models\\tt100k_yolo26s_best.pt",
     "display_name": "tt100k_yolo26s_best",
     "training_name": "tt100k_yolo26s",
-    "training_dir": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s",
+    "training_dir": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s",
     "dataset": "/root/autodl-tmp/tt100k.yaml",
     "base_model": "/root/autodl-tmp/YOLO26-PySide6-GUI/models/yolo26s.pt",
     "task": "detect",
@@ -13,7 +13,7 @@
     "batch": "8",
     "device": "0",
     "imported_at": "2026-07-06 15:42:22",
-    "updated_at": "2026-07-06 15:42:22",
+    "updated_at": "2026-07-07 16:54:23",
     "file_size": 20465939,
     "modified_at": "2026-07-05 21:27:58",
     "metrics": {
@@ -31,16 +31,16 @@
       "total_epochs": 100
     },
     "artifacts": {
-      "results_csv": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\results.csv",
-      "args_yaml": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\args.yaml",
-      "best_weight": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\weights\\best.pt",
-      "results_png": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\results.png",
-      "pr_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\BoxPR_curve.png",
-      "f1_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\BoxF1_curve.png",
-      "precision_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\BoxP_curve.png",
-      "recall_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\BoxR_curve.png",
-      "confusion_matrix": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\confusion_matrix.png",
-      "confusion_matrix_normalized": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26s\\confusion_matrix_normalized.png"
+      "results_csv": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\results.csv",
+      "args_yaml": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\args.yaml",
+      "best_weight": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\weights\\best.pt",
+      "results_png": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\results.png",
+      "pr_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\BoxPR_curve.png",
+      "f1_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\BoxF1_curve.png",
+      "precision_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\BoxP_curve.png",
+      "recall_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\BoxR_curve.png",
+      "confusion_matrix": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\confusion_matrix.png",
+      "confusion_matrix_normalized": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26s\\confusion_matrix_normalized.png"
     },
     "recommended_for": "",
     "tags": "",
@@ -48,10 +48,10 @@
   },
   {
     "model_name": "tt100k_yolo26x_best.pt",
-    "model_path": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\models\\tt100k_yolo26x_best.pt",
+    "model_path": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized-main\\models\\tt100k_yolo26x_best.pt",
     "display_name": "tt100k_yolo26x_best",
     "training_name": "tt100k_yolo26x",
-    "training_dir": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x",
+    "training_dir": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x",
     "dataset": "/root/autodl-tmp/tt100k.yaml",
     "base_model": "/root/autodl-tmp/yolo26x.pt",
     "task": "detect",
@@ -60,7 +60,7 @@
     "batch": "8",
     "device": "0",
     "imported_at": "2026-07-06 15:41:50",
-    "updated_at": "2026-07-06 15:41:50",
+    "updated_at": "2026-07-07 16:54:23",
     "file_size": 118602163,
     "modified_at": "2026-07-06 15:34:32",
     "metrics": {
@@ -78,16 +78,16 @@
       "total_epochs": 100
     },
     "artifacts": {
-      "results_csv": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\results.csv",
-      "args_yaml": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\args.yaml",
-      "best_weight": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\weights\\best.pt",
-      "results_png": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\results.png",
-      "pr_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\BoxPR_curve.png",
-      "f1_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\BoxF1_curve.png",
-      "precision_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\BoxP_curve.png",
-      "recall_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\BoxR_curve.png",
-      "confusion_matrix": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\confusion_matrix.png",
-      "confusion_matrix_normalized": "C:\\Users\\lenovo\\Desktop\\yolo26\\YOLO26-PySide6-GUI-optimized\\runs\\tt100k_yolo26x\\confusion_matrix_normalized.png"
+      "results_csv": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\results.csv",
+      "args_yaml": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\args.yaml",
+      "best_weight": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\weights\\best.pt",
+      "results_png": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\results.png",
+      "pr_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\BoxPR_curve.png",
+      "f1_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\BoxF1_curve.png",
+      "precision_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\BoxP_curve.png",
+      "recall_curve": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\BoxR_curve.png",
+      "confusion_matrix": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\confusion_matrix.png",
+      "confusion_matrix_normalized": "C:\\Users\\lenovo\\Desktop\\yolo26\\runs\\tt100k_yolo26x\\confusion_matrix_normalized.png"
     },
     "recommended_for": "",
     "tags": "",

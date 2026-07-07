@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -46,14 +47,22 @@ from PySide6.QtWidgets import (
 )
 
 from core.detection_worker import DetectionWorker
+from core.dataset_checker import check_dataset
+from core.evaluation_worker import (
+    EvaluationConfig,
+    EvaluationWorker,
+    SCENE_TAGS,
+    write_evaluation_report,
+)
 from core.history_store import HistoryStore
 from core.models import DetectionConfig, FrameResult, SourceSpec, iter_supported_media
 from core.review_dataset import build_labelimg_args, export_review_sample, resolve_labelimg_executable
-from core.weight_registry import WeightRegistryStore
+from core.weight_registry import WeightRegistryStore, ensure_training_run_weights
 from ui.theme import APP_QSS
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_ULTRALYTICS = PROJECT_ROOT / "ultralytics"
 CONFIG_DIR = PROJECT_ROOT / "config"
 MODELS_DIR = PROJECT_ROOT / "models"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -347,6 +356,759 @@ class ArtifactPreview(QLabel):
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+
+class DatasetCheckDialog(QDialog):
+    SUMMARY_FIELDS = [
+        ("图片总数", "total_images"),
+        ("检测框总数", "total_boxes"),
+        ("平均每图框数", "avg_boxes_per_image"),
+        ("小目标数量", "small_targets"),
+        ("小目标比例", "small_target_ratio"),
+        ("缺失标注", "missing_labels"),
+        ("孤儿标注", "orphan_labels"),
+        ("损坏图片", "bad_images"),
+        ("类别越界", "class_id_out_of_bounds"),
+        ("非法标注行", "invalid_label_lines"),
+    ]
+
+    IMAGE_FIELDS = [
+        ("类别图片数", "class_image_hist"),
+        ("类别检测框数", "class_box_hist"),
+        ("小目标数量", "small_target_hist"),
+    ]
+
+    def __init__(self, output_root: Path, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.output_root = output_root
+        self.report: Dict = {}
+        self._summary_labels: Dict[str, QLabel] = {}
+        self._artifact_widgets: Dict[str, ArtifactPreview] = {}
+
+        self.setWindowTitle("数据集检查")
+        self.resize(1100, 720)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        path_row = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("选择 YOLO 数据集目录或 data.yaml")
+        dir_btn = QPushButton("选择目录")
+        dir_btn.clicked.connect(self._choose_dir)
+        yaml_btn = QPushButton("选择 YAML")
+        yaml_btn.clicked.connect(self._choose_yaml)
+        self.run_btn = QPushButton("开始检查")
+        self.run_btn.setObjectName("PrimaryButton")
+        self.run_btn.clicked.connect(self._run_check)
+        path_row.addWidget(self.path_edit, 1)
+        path_row.addWidget(dir_btn)
+        path_row.addWidget(yaml_btn)
+        path_row.addWidget(self.run_btn)
+        layout.addLayout(path_row)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_summary_panel())
+        splitter.addWidget(self._build_issue_panel())
+        splitter.setSizes([430, 670])
+        layout.addWidget(splitter, 1)
+
+        bottom = QHBoxLayout()
+        self.status_label = QLabel("请选择数据集")
+        self.status_label.setObjectName("Muted")
+        self.open_output_btn = QPushButton("打开报告目录")
+        self.open_output_btn.setEnabled(False)
+        self.open_output_btn.clicked.connect(self._open_output_dir)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        bottom.addWidget(self.status_label, 1)
+        bottom.addWidget(self.open_output_btn)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+    def _build_summary_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        summary = QFrame()
+        summary.setObjectName("Panel")
+        grid = QGridLayout(summary)
+        grid.setContentsMargins(14, 14, 14, 14)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+        for index, (title, key) in enumerate(self.SUMMARY_FIELDS):
+            title_label = QLabel(title)
+            title_label.setObjectName("Muted")
+            value_label = QLabel("--")
+            value_label.setObjectName("MetricValue" if index < 4 else "")
+            self._summary_labels[key] = value_label
+            grid.addWidget(title_label, index, 0)
+            grid.addWidget(value_label, index, 1)
+        layout.addWidget(summary)
+
+        images = QFrame()
+        images.setObjectName("Panel")
+        image_layout = QVBoxLayout(images)
+        image_layout.setContentsMargins(14, 14, 14, 14)
+        image_layout.setSpacing(8)
+        for title, key in self.IMAGE_FIELDS:
+            preview = ArtifactPreview(title)
+            preview.setMinimumHeight(130)
+            self._artifact_widgets[key] = preview
+            image_layout.addWidget(preview)
+        layout.addWidget(images, 1)
+        return panel
+
+    def _build_issue_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("异常文件列表"))
+        self.issue_table = QTableWidget(0, 3)
+        self.issue_table.setHorizontalHeaderLabels(["类型", "路径", "详情"])
+        self.issue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.issue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.issue_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.issue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        layout.addWidget(self.issue_table, 1)
+        return panel
+
+    def _choose_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择 YOLO 数据集目录", str(PROJECT_ROOT.parent))
+        if folder:
+            self.path_edit.setText(folder)
+
+    def _choose_yaml(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "选择 data.yaml", str(PROJECT_ROOT.parent), "YAML (*.yaml *.yml)")
+        if filename:
+            self.path_edit.setText(filename)
+
+    def _run_check(self) -> None:
+        dataset_path = self.path_edit.text().strip()
+        if not dataset_path:
+            QMessageBox.information(self, "请选择数据集", "请先选择 YOLO 数据集目录或 data.yaml。")
+            return
+        if not Path(dataset_path).exists():
+            QMessageBox.warning(self, "路径不存在", dataset_path)
+            return
+        self.run_btn.setEnabled(False)
+        self.status_label.setText("正在检查数据集...")
+        QApplication.processEvents()
+        try:
+            self.report = check_dataset(dataset_path, self.output_root)
+        except Exception as exc:
+            QMessageBox.warning(self, "检查失败", str(exc))
+            self.status_label.setText("检查失败")
+        else:
+            self._show_report(self.report)
+            self.status_label.setText(f"检查完成：{self.report.get('output_dir', '')}")
+            self.open_output_btn.setEnabled(True)
+        finally:
+            self.run_btn.setEnabled(True)
+
+    def _show_report(self, report: Dict) -> None:
+        summary = report.get("summary") or {}
+        for _title, key in self.SUMMARY_FIELDS:
+            value = summary.get(key, "--")
+            if key == "small_target_ratio":
+                try:
+                    value = f"{float(value):.2%}"
+                except (TypeError, ValueError):
+                    value = "--"
+            self._summary_labels[key].setText(str(value))
+
+        issues = report.get("issues") or []
+        self.issue_table.setRowCount(len(issues))
+        for row, item in enumerate(issues):
+            values = [item.get("issue_type", ""), item.get("path", ""), item.get("detail", "")]
+            for col, value in enumerate(values):
+                table_item = QTableWidgetItem(str(value))
+                table_item.setToolTip(str(value))
+                self.issue_table.setItem(row, col, table_item)
+
+        artifacts = report.get("artifacts") or {}
+        for _title, key in self.IMAGE_FIELDS:
+            self._artifact_widgets[key].set_artifact(str(artifacts.get(key, "")), self._open_artifact_zoom)
+
+    def _open_output_dir(self) -> None:
+        output_dir = self.report.get("output_dir", "") if self.report else ""
+        if output_dir and Path(output_dir).exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))
+
+    def _open_artifact_zoom(self, title: str, path: str) -> None:
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return
+        dialog = ImageZoomDialog(title, pixmap, self)
+        dialog.exec()
+
+
+class FailureNoteDialog(QDialog):
+    def __init__(self, case: Dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("记录失败原因")
+        self.resize(460, 230)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        layout.addWidget(QLabel(f"{case.get('case_label', '')}：{case.get('detail', '')}"))
+        layout.addWidget(QLabel("场景分类"))
+        self.scenario_combo = QComboBox()
+        self.scenario_combo.addItems([""] + SCENE_TAGS)
+        current = str(case.get("scenario", ""))
+        index = self.scenario_combo.findText(current)
+        if index >= 0:
+            self.scenario_combo.setCurrentIndex(index)
+        layout.addWidget(self.scenario_combo)
+
+        layout.addWidget(QLabel("一句原因说明"))
+        self.note_edit = QLineEdit(str(case.get("reason_note", "")))
+        self.note_edit.setPlaceholderText("例如：逆光导致标志边缘弱、遮挡面积过大、目标太小")
+        layout.addWidget(self.note_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> Dict[str, str]:
+        return {
+            "scenario": self.scenario_combo.currentText().strip(),
+            "reason_note": self.note_edit.text().strip(),
+        }
+
+
+class EvaluationDialog(QDialog):
+    SUMMARY_FIELDS = [
+        ("评测图片", "evaluated_images"),
+        ("GT框", "ground_truth_boxes"),
+        ("预测框", "predicted_boxes"),
+        ("Precision", "precision"),
+        ("Recall", "recall"),
+        ("mAP", "mAP"),
+        ("误检率", "false_positive_rate"),
+        ("漏检率", "false_negative_rate"),
+        ("误检最多类别", "top_false_positive_class"),
+        ("漏检最多类别", "top_false_negative_class"),
+    ]
+
+    def __init__(
+        self,
+        model_path: Path,
+        model_name: str,
+        conf: float,
+        iou: float,
+        output_root: Path,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.model_path = model_path
+        self.model_name = model_name
+        self.conf = conf
+        self.iou = iou
+        self.output_root = output_root
+        self.report: Dict = {}
+        self.worker: Optional[EvaluationWorker] = None
+        self.worker_thread: Optional[QThread] = None
+        self._summary_labels: Dict[str, QLabel] = {}
+
+        self.setWindowTitle("评测集评估")
+        self.resize(1120, 720)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        top = QGridLayout()
+        top.setHorizontalSpacing(8)
+        top.setVerticalSpacing(8)
+        top.addWidget(QLabel("当前模型"), 0, 0)
+        self.model_label = QLabel(f"{model_name}  ({model_path})")
+        self.model_label.setWordWrap(True)
+        top.addWidget(self.model_label, 0, 1, 1, 5)
+        top.addWidget(QLabel("评测集"), 1, 0)
+        self.dataset_edit = QLineEdit()
+        self.dataset_edit.setPlaceholderText("选择 200 张自标注评测集目录或 data.yaml")
+        top.addWidget(self.dataset_edit, 1, 1, 1, 3)
+        dataset_dir_btn = QPushButton("选择目录")
+        dataset_dir_btn.clicked.connect(self._choose_dir)
+        dataset_yaml_btn = QPushButton("选择 YAML")
+        dataset_yaml_btn.clicked.connect(self._choose_yaml)
+        top.addWidget(dataset_dir_btn, 1, 4)
+        top.addWidget(dataset_yaml_btn, 1, 5)
+
+        top.addWidget(QLabel("最多图片"), 2, 0)
+        self.max_images_spin = QSpinBox()
+        self.max_images_spin.setRange(1, 10000)
+        self.max_images_spin.setValue(200)
+        top.addWidget(self.max_images_spin, 2, 1)
+        top.addWidget(QLabel("Conf"), 2, 2)
+        self.conf_spin = QDoubleSpinBox()
+        self.conf_spin.setRange(0.01, 1.0)
+        self.conf_spin.setSingleStep(0.01)
+        self.conf_spin.setDecimals(2)
+        self.conf_spin.setValue(conf)
+        top.addWidget(self.conf_spin, 2, 3)
+        top.addWidget(QLabel("IoU"), 2, 4)
+        self.iou_spin = QDoubleSpinBox()
+        self.iou_spin.setRange(0.01, 1.0)
+        self.iou_spin.setSingleStep(0.01)
+        self.iou_spin.setDecimals(2)
+        self.iou_spin.setValue(iou)
+        top.addWidget(self.iou_spin, 2, 5)
+        layout.addLayout(top)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_summary_panel())
+        splitter.addWidget(self._build_failure_panel())
+        splitter.setSizes([380, 740])
+        layout.addWidget(splitter, 1)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1000)
+        layout.addWidget(self.progress_bar)
+
+        bottom = QHBoxLayout()
+        self.status_label = QLabel("请选择评测集")
+        self.status_label.setObjectName("Muted")
+        self.run_btn = QPushButton("开始评测")
+        self.run_btn.setObjectName("PrimaryButton")
+        self.run_btn.clicked.connect(self._start_evaluation)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setObjectName("DangerButton")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_evaluation)
+        self.note_btn = QPushButton("记录失败原因")
+        self.note_btn.setEnabled(False)
+        self.note_btn.clicked.connect(self._record_failure_note)
+        self.open_predictions_btn = QPushButton("打开预测图")
+        self.open_predictions_btn.setEnabled(False)
+        self.open_predictions_btn.clicked.connect(self._open_predictions_dir)
+        self.open_errors_btn = QPushButton("打开错误库")
+        self.open_errors_btn.setEnabled(False)
+        self.open_errors_btn.clicked.connect(self._open_errors_dir)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        bottom.addWidget(self.status_label, 1)
+        bottom.addWidget(self.run_btn)
+        bottom.addWidget(self.stop_btn)
+        bottom.addWidget(self.note_btn)
+        bottom.addWidget(self.open_predictions_btn)
+        bottom.addWidget(self.open_errors_btn)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+    def _build_summary_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(8)
+        for index, (title, key) in enumerate(self.SUMMARY_FIELDS):
+            title_label = QLabel(title)
+            title_label.setObjectName("Muted")
+            value_label = QLabel("--")
+            value_label.setWordWrap(True)
+            self._summary_labels[key] = value_label
+            layout.addWidget(title_label, index, 0)
+            layout.addWidget(value_label, index, 1)
+        layout.setRowStretch(len(self.SUMMARY_FIELDS), 1)
+        return panel
+
+    def _build_failure_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("失败案例"))
+        self.failure_table = QTableWidget(0, 6)
+        self.failure_table.setHorizontalHeaderLabels(["编号", "类型", "场景", "原因", "图片", "详情"])
+        self.failure_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.failure_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.failure_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.failure_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.failure_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        layout.addWidget(self.failure_table, 1)
+        return panel
+
+    def _choose_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择评测集目录", str(PROJECT_ROOT.parent))
+        if folder:
+            self.dataset_edit.setText(folder)
+
+    def _choose_yaml(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "选择评测集 data.yaml", str(PROJECT_ROOT.parent), "YAML (*.yaml *.yml)")
+        if filename:
+            self.dataset_edit.setText(filename)
+
+    def _start_evaluation(self) -> None:
+        dataset_path = self.dataset_edit.text().strip()
+        if not dataset_path:
+            QMessageBox.information(self, "请选择评测集", "请先选择自标注评测集目录或 data.yaml。")
+            return
+        if not Path(dataset_path).exists():
+            QMessageBox.warning(self, "路径不存在", dataset_path)
+            return
+        if not self.model_path.exists():
+            QMessageBox.warning(self, "模型不存在", f"找不到当前模型权重：{self.model_path}")
+            return
+
+        config = EvaluationConfig(
+            model_path=str(self.model_path),
+            dataset_path=dataset_path,
+            output_root=str(self.output_root),
+            conf=self.conf_spin.value(),
+            iou=self.iou_spin.value(),
+            max_images=self.max_images_spin.value(),
+        )
+        self.worker_thread = QThread(self)
+        self.worker = EvaluationWorker(config)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.status_changed.connect(self.status_label.setText)
+        self.worker.progress_changed.connect(self.progress_bar.setValue)
+        self.worker.report_ready.connect(self._show_report)
+        self.worker.error.connect(self._on_error)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self._on_thread_finished)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.note_btn.setEnabled(False)
+        self.open_predictions_btn.setEnabled(False)
+        self.open_errors_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("正在启动评测...")
+        self.worker_thread.start()
+
+    def _stop_evaluation(self) -> None:
+        if self.worker:
+            self.worker.stop()
+            self.stop_btn.setEnabled(False)
+            self.status_label.setText("正在停止评测...")
+
+    def _show_report(self, report: Dict) -> None:
+        self.report = report
+        summary = report.get("summary") or {}
+        for _title, key in self.SUMMARY_FIELDS:
+            value = summary.get(key, "--")
+            if key in {"precision", "recall", "mAP", "false_positive_rate", "false_negative_rate"}:
+                try:
+                    value = f"{float(value):.4f}"
+                except (TypeError, ValueError):
+                    value = "--"
+            self._summary_labels[key].setText(str(value))
+        self._refresh_failure_table()
+        self.note_btn.setEnabled(bool(report.get("failure_cases")))
+        self.open_predictions_btn.setEnabled(True)
+        self.open_errors_btn.setEnabled(True)
+        self.status_label.setText(f"评测完成：{report.get('output_dir', '')}")
+
+    def _refresh_failure_table(self) -> None:
+        cases = self.report.get("failure_cases") or []
+        self.failure_table.setRowCount(len(cases))
+        for row, case in enumerate(cases):
+            values = [
+                case.get("case_id", ""),
+                case.get("case_label", ""),
+                case.get("scenario", ""),
+                case.get("reason_note", ""),
+                case.get("image_path", ""),
+                case.get("detail", ""),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(value))
+                self.failure_table.setItem(row, col, item)
+
+    def _record_failure_note(self) -> None:
+        row = self.failure_table.currentRow()
+        cases = self.report.get("failure_cases") or []
+        if row < 0 or row >= len(cases):
+            QMessageBox.information(self, "请选择案例", "请先在失败案例表中选择一行。")
+            return
+        case = cases[row]
+        dialog = FailureNoteDialog(case, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        case.update(dialog.values())
+        output_dir = Path(self.report.get("output_dir", ""))
+        if output_dir.exists():
+            write_evaluation_report(self.report, output_dir)
+        self._refresh_failure_table()
+        self.status_label.setText("失败原因已写入 failure_cases.csv")
+
+    def _on_error(self, message: str) -> None:
+        QMessageBox.warning(self, "评测失败", message)
+        self.status_label.setText("评测失败")
+
+    def _on_thread_finished(self) -> None:
+        self.worker = None
+        self.worker_thread = None
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+    def _open_predictions_dir(self) -> None:
+        path = self.report.get("artifacts", {}).get("predictions_dir", "")
+        if path and Path(path).exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _open_errors_dir(self) -> None:
+        path = self.report.get("artifacts", {}).get("errors_dir", "")
+        if path and Path(path).exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.worker and self.worker_thread and self.worker_thread.isRunning():
+            self.worker.stop()
+            self.worker_thread.quit()
+            self.worker_thread.wait(3000)
+        event.accept()
+
+
+class TrainLauncherDialog(QDialog):
+    def __init__(
+        self,
+        store: WeightRegistryStore,
+        models_dir: Path,
+        default_model_path: Path,
+        refresh_callback,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.store = store
+        self.models_dir = models_dir
+        self.default_model_path = default_model_path
+        self.refresh_callback = refresh_callback
+        self.process: Optional[QProcess] = None
+
+        self.setWindowTitle("训练启动")
+        self.resize(920, 620)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(8)
+        self.data_edit = QLineEdit()
+        self.data_edit.setPlaceholderText("训练 data.yaml")
+        data_btn = QPushButton("选择")
+        data_btn.clicked.connect(self._choose_data_yaml)
+        form.addWidget(QLabel("数据集 YAML"), 0, 0)
+        form.addWidget(self.data_edit, 0, 1)
+        form.addWidget(data_btn, 0, 2)
+
+        self.model_edit = QLineEdit(str(default_model_path) if default_model_path.exists() else "")
+        self.model_edit.setPlaceholderText("基础模型或已有权重 .pt")
+        model_btn = QPushButton("选择")
+        model_btn.clicked.connect(self._choose_model)
+        form.addWidget(QLabel("基础模型"), 1, 0)
+        form.addWidget(self.model_edit, 1, 1)
+        form.addWidget(model_btn, 1, 2)
+
+        self.project_edit = QLineEdit(str(PROJECT_ROOT.parent / "runs"))
+        project_btn = QPushButton("选择")
+        project_btn.clicked.connect(self._choose_project)
+        form.addWidget(QLabel("输出目录"), 2, 0)
+        form.addWidget(self.project_edit, 2, 1)
+        form.addWidget(project_btn, 2, 2)
+
+        self.name_edit = QLineEdit(f"gui_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        form.addWidget(QLabel("训练名称"), 3, 0)
+        form.addWidget(self.name_edit, 3, 1, 1, 2)
+
+        self.epochs_spin = QSpinBox()
+        self.epochs_spin.setRange(1, 1000)
+        self.epochs_spin.setValue(100)
+        self.imgsz_spin = QSpinBox()
+        self.imgsz_spin.setRange(64, 4096)
+        self.imgsz_spin.setSingleStep(32)
+        self.imgsz_spin.setValue(1024)
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(1, 256)
+        self.batch_spin.setValue(8)
+        self.device_edit = QLineEdit("0")
+        form.addWidget(QLabel("epochs"), 4, 0)
+        form.addWidget(self.epochs_spin, 4, 1)
+        form.addWidget(QLabel("imgsz"), 5, 0)
+        form.addWidget(self.imgsz_spin, 5, 1)
+        form.addWidget(QLabel("batch"), 6, 0)
+        form.addWidget(self.batch_spin, 6, 1)
+        form.addWidget(QLabel("device"), 7, 0)
+        form.addWidget(self.device_edit, 7, 1)
+        layout.addLayout(form)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("训练日志会显示在这里；完成后会自动导入 best.pt 到 models。")
+        layout.addWidget(self.log_view, 1)
+
+        bottom = QHBoxLayout()
+        self.status_label = QLabel("未启动")
+        self.status_label.setObjectName("Muted")
+        self.start_btn = QPushButton("开始训练")
+        self.start_btn.setObjectName("PrimaryButton")
+        self.start_btn.clicked.connect(self._start_training)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setObjectName("DangerButton")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_training)
+        open_btn = QPushButton("打开输出目录")
+        open_btn.clicked.connect(self._open_project_dir)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        bottom.addWidget(self.status_label, 1)
+        bottom.addWidget(self.start_btn)
+        bottom.addWidget(self.stop_btn)
+        bottom.addWidget(open_btn)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+    def _choose_data_yaml(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "选择训练 data.yaml", str(PROJECT_ROOT.parent), "YAML (*.yaml *.yml)")
+        if filename:
+            self.data_edit.setText(filename)
+
+    def _choose_model(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "选择基础模型", str(PROJECT_ROOT.parent), "YOLO weights (*.pt)")
+        if filename:
+            self.model_edit.setText(filename)
+
+    def _choose_project(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择训练输出目录", str(PROJECT_ROOT.parent))
+        if folder:
+            self.project_edit.setText(folder)
+
+    def _start_training(self) -> None:
+        data_path = Path(self.data_edit.text().strip())
+        model_path = Path(self.model_edit.text().strip())
+        project_path = Path(self.project_edit.text().strip())
+        run_name = self.name_edit.text().strip()
+        if not data_path.exists():
+            QMessageBox.warning(self, "数据集不存在", str(data_path))
+            return
+        if not model_path.exists():
+            QMessageBox.warning(self, "基础模型不存在", str(model_path))
+            return
+        if not run_name:
+            QMessageBox.warning(self, "训练名称为空", "请填写训练名称。")
+            return
+
+        project_path.mkdir(parents=True, exist_ok=True)
+        code = self._build_train_code(data_path, model_path, project_path, run_name)
+        self.process = QProcess(self)
+        self.process.setWorkingDirectory(str(PROJECT_ROOT))
+        self.process.readyReadStandardOutput.connect(self._read_stdout)
+        self.process.readyReadStandardError.connect(self._read_stderr)
+        self.process.finished.connect(lambda exit_code, status: self._on_finished(exit_code, status, project_path / run_name))
+        self.process.start(sys.executable, ["-c", code])
+        if not self.process.waitForStarted(3000):
+            QMessageBox.warning(self, "训练启动失败", self.process.errorString())
+            self.process = None
+            return
+
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.status_label.setText("训练中")
+        self.log_view.appendPlainText("训练已启动。")
+
+    def _build_train_code(self, data_path: Path, model_path: Path, project_path: Path, run_name: str) -> str:
+        values = {
+            "local_ultralytics": str(LOCAL_ULTRALYTICS),
+            "model": str(model_path),
+            "data": str(data_path),
+            "project": str(project_path),
+            "name": run_name,
+            "epochs": self.epochs_spin.value(),
+            "imgsz": self.imgsz_spin.value(),
+            "batch": self.batch_spin.value(),
+            "device": self.device_edit.text().strip() or "0",
+        }
+        return (
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            f"sys.path.insert(0, {json.dumps(values['local_ultralytics'], ensure_ascii=False)})\n"
+            "from ultralytics import YOLO\n"
+            "try:\n"
+            "    import torch\n"
+            "except Exception:\n"
+            "    torch = None\n"
+            "started = time.time()\n"
+            f"model = YOLO({json.dumps(values['model'], ensure_ascii=False)})\n"
+            "print('TRAIN_STARTED')\n"
+            "model.train("
+            f"data={json.dumps(values['data'], ensure_ascii=False)}, "
+            f"epochs={values['epochs']}, "
+            f"imgsz={values['imgsz']}, "
+            f"batch={values['batch']}, "
+            f"device={json.dumps(values['device'], ensure_ascii=False)}, "
+            f"project={json.dumps(values['project'], ensure_ascii=False)}, "
+            f"name={json.dumps(values['name'], ensure_ascii=False)}, "
+            "plots=True, exist_ok=True)\n"
+            "elapsed = time.time() - started\n"
+            "print(f'TRAIN_TIME_SECONDS={elapsed:.1f}')\n"
+            "if torch is not None and torch.cuda.is_available():\n"
+            "    print(f'MAX_GPU_MEMORY_MB={torch.cuda.max_memory_reserved() / 1024 / 1024:.1f}')\n"
+            "print('TRAIN_FINISHED')\n"
+        )
+
+    def _read_stdout(self) -> None:
+        if not self.process:
+            return
+        text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if text:
+            self.log_view.appendPlainText(text.rstrip())
+
+    def _read_stderr(self) -> None:
+        if not self.process:
+            return
+        text = bytes(self.process.readAllStandardError()).decode("utf-8", errors="replace")
+        if text:
+            self.log_view.appendPlainText(text.rstrip())
+
+    def _stop_training(self) -> None:
+        if self.process and self.process.state() != QProcess.NotRunning:
+            self.process.terminate()
+            self.status_label.setText("正在停止训练...")
+            self.stop_btn.setEnabled(False)
+
+    def _on_finished(self, exit_code: int, _status, run_dir: Path) -> None:
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText(f"训练结束，退出码：{exit_code}")
+        if exit_code == 0 and (run_dir / "weights" / "best.pt").exists():
+            try:
+                record = self.store.import_training_run(run_dir, self.models_dir)
+            except Exception as exc:
+                QMessageBox.warning(self, "导入训练权重失败", str(exc))
+            else:
+                self.refresh_callback(record.get("model_name", ""))
+                self.status_label.setText(f"训练完成并已导入：{record.get('model_name', '')}")
+        self.process = None
+
+    def _open_project_dir(self) -> None:
+        path = Path(self.project_edit.text().strip() or str(PROJECT_ROOT.parent / "runs"))
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.process and self.process.state() != QProcess.NotRunning:
+            self.process.terminate()
+            self.process.waitForFinished(3000)
+        event.accept()
 
 
 class WeightManagerDialog(QDialog):
@@ -744,8 +1506,10 @@ class MainWindow(QMainWindow):
         self._auto_follow_preview = True
         self._browser_updating = False
         self.labelimg_process: Optional[QProcess] = None
+        self._checked_training_runs = False
 
         self._build_ui()
+        self._ensure_training_run_weights_available()
         self._load_models()
         self._load_settings()
         self._refresh_history_table()
@@ -791,6 +1555,15 @@ class MainWindow(QMainWindow):
         self.open_outputs_btn.clicked.connect(self._open_outputs_dir)
         self.open_csv_btn = QPushButton("打开CSV历史")
         self.open_csv_btn.clicked.connect(self._open_history_csv)
+        self.dataset_check_btn = QPushButton("数据集检查")
+        self.dataset_check_btn.clicked.connect(self._open_dataset_checker)
+        self.evaluation_btn = QPushButton("评测集评估")
+        self.evaluation_btn.clicked.connect(self._open_evaluation_dialog)
+        self.train_btn = QPushButton("训练启动")
+        self.train_btn.clicked.connect(self._open_train_dialog)
+        row.addWidget(self.dataset_check_btn)
+        row.addWidget(self.evaluation_btn)
+        row.addWidget(self.train_btn)
         row.addWidget(self.open_outputs_btn)
         row.addWidget(self.open_csv_btn)
         return frame
@@ -1041,6 +1814,36 @@ class MainWindow(QMainWindow):
         spin.valueChanged.connect(spin_to_slider)
         slider.valueChanged.connect(slider_to_spin)
 
+    def _ensure_training_run_weights_available(self) -> None:
+        if self._checked_training_runs:
+            return
+        self._checked_training_runs = True
+        try:
+            imported = ensure_training_run_weights(
+                self.weight_store,
+                MODELS_DIR,
+                [PROJECT_ROOT.parent / "runs", PROJECT_ROOT / "runs"],
+            )
+        except Exception as exc:
+            self._set_status(f"自动导入训练权重失败：{exc}")
+            return
+        if imported:
+            self._set_status(f"已从 runs 自动导入 {len(imported)} 个训练权重")
+
+    def _current_model_path(self) -> Optional[Path]:
+        model_name = self.model_combo.currentText() if hasattr(self, "model_combo") else ""
+        if not model_name:
+            return None
+        record = self.weight_store.get_by_model_name(model_name)
+        if record:
+            model_path = Path(str(record.get("model_path", "")))
+            if model_path.exists():
+                return model_path
+        local_path = MODELS_DIR / model_name
+        if local_path.exists():
+            return local_path
+        return None
+
     def _load_models(self) -> None:
         MODELS_DIR.mkdir(exist_ok=True)
         current_model = self.model_combo.currentText() if hasattr(self, "model_combo") else ""
@@ -1206,14 +2009,54 @@ class MainWindow(QMainWindow):
 
     def _current_config(self) -> DetectionConfig:
         model_name = self.model_combo.currentText()
+        model_path = self._current_model_path() or (MODELS_DIR / model_name)
         return DetectionConfig(
-            model_path=str(MODELS_DIR / model_name),
+            model_path=str(model_path),
             conf=self.conf_spin.value(),
             iou=self.iou_spin.value(),
             rate_ms=self.rate_spin.value(),
             save_results=self.save_result_check.isChecked(),
             save_txt=self.save_txt_check.isChecked(),
         )
+
+    def _open_dataset_checker(self) -> None:
+        dialog = DatasetCheckDialog(OUTPUT_DIR, self)
+        dialog.exec()
+
+    def _open_evaluation_dialog(self) -> None:
+        if self.model_combo.count() == 0:
+            QMessageBox.warning(self, "没有模型", "请先导入或放入 .pt 权重。")
+            return
+        model_path = self._current_model_path()
+        if model_path is None:
+            QMessageBox.warning(self, "模型不存在", "当前模型权重路径无效，请先在权重管理中重新导入。")
+            return
+        dialog = EvaluationDialog(
+            model_path,
+            self.model_combo.currentText(),
+            self.conf_spin.value(),
+            self.iou_spin.value(),
+            OUTPUT_DIR,
+            self,
+        )
+        dialog.exec()
+
+    def _open_train_dialog(self) -> None:
+        model_path = self._current_model_path() or Path("__missing_model__.pt")
+        dialog = TrainLauncherDialog(
+            self.weight_store,
+            MODELS_DIR,
+            model_path,
+            self._on_training_weight_imported,
+            self,
+        )
+        dialog.exec()
+
+    def _on_training_weight_imported(self, model_name: str) -> None:
+        self._load_models()
+        if model_name:
+            self._select_model_by_name(model_name)
+        self._set_status(f"训练权重已导入：{model_name}")
 
     def _open_weight_manager(self) -> None:
         dialog = WeightManagerDialog(

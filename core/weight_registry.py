@@ -375,3 +375,43 @@ def _to_int(value: Any, default: int = 0) -> int:
 
 def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_training_run_weights(
+    store: WeightRegistryStore,
+    models_dir: str | Path,
+    run_roots: List[str | Path],
+) -> List[Dict[str, Any]]:
+    """Import available YOLO run directories so the GUI has local weights to load."""
+    models_path = Path(models_dir)
+    models_path.mkdir(parents=True, exist_ok=True)
+
+    imported: List[Dict[str, Any]] = []
+    for run_dir in discover_training_runs(run_roots):
+        try:
+            record = store.import_training_run(run_dir, models_path)
+        except Exception:
+            continue
+        imported.append(record)
+    return imported
+
+
+def discover_training_runs(run_roots: List[str | Path]) -> List[Path]:
+    runs: List[Path] = []
+    seen: set[str] = set()
+    for root in run_roots:
+        root_path = Path(root)
+        if not root_path.exists() or not root_path.is_dir():
+            continue
+        for run_dir in sorted(root_path.iterdir(), key=lambda path: path.name.lower()):
+            if not run_dir.is_dir():
+                continue
+            best_weight = run_dir / "weights" / "best.pt"
+            if not best_weight.exists():
+                continue
+            key = str(run_dir.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            runs.append(run_dir)
+    return runs
