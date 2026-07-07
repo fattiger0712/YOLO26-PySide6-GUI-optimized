@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import shutil
 import sys
 import threading
@@ -14,6 +15,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 
+from core.inference import create_predictor
 from core.dataset_checker import (
     SMALL_TARGET_PX,
     class_name,
@@ -98,12 +100,12 @@ def evaluate_dataset(
     predictions_dir = output_dir / "predictions"
     errors_dir = output_dir / "errors"
     predictions_dir.mkdir(parents=True, exist_ok=True)
-    for folder_name in list(FAILURE_TYPES.values()) + SCENE_TAGS:
+    for folder_name in list(FAILURE_TYPES.keys()) + [safe_name(tag) for tag in SCENE_TAGS]:
         (errors_dir / folder_name).mkdir(parents=True, exist_ok=True)
 
     if predictor is None:
         status_callback and status_callback("正在加载评测模型...")
-        predictor = UltralyticsPredictor(config)
+        predictor = ModelPredictor(config)
 
     per_class: Dict[int, Dict[str, Any]] = {}
     ranked_predictions: Dict[int, List[Tuple[float, bool]]] = {}
@@ -146,7 +148,7 @@ def evaluate_dataset(
         image_case_types = case_types_for_image(truths, result)
         for case_type in image_case_types:
             case_label = FAILURE_TYPES[case_type]
-            artifact_path = errors_dir / case_label / f"{safe_name(image_path.stem)}_{case_type}.jpg"
+            artifact_path = errors_dir / case_type / f"{safe_name(image_path.stem)}_{case_type}.jpg"
             shutil.copy2(pred_path, artifact_path)
             failure_cases.append(
                 {
@@ -217,57 +219,12 @@ def evaluate_dataset(
     return report
 
 
-class UltralyticsPredictor:
+class ModelPredictor:
     def __init__(self, config: EvaluationConfig):
-        from ultralytics import YOLO
-
-        self.config = config
-        self.model = YOLO(config.model_path)
+        self.predictor = create_predictor(config)
 
     def __call__(self, frame: np.ndarray, _image_path: Path) -> Iterable[Dict[str, Any]]:
-        result = self.model.predict(
-            frame,
-            save=False,
-            save_txt=False,
-            imgsz=self.config.imgsz,
-            conf=self.config.conf,
-            iou=self.config.iou,
-            device=self._device(),
-            verbose=False,
-        )[0]
-        boxes = getattr(result, "boxes", None)
-        if boxes is None or getattr(boxes, "xyxy", None) is None:
-            return []
-
-        names = getattr(result, "names", None) or getattr(self.model, "names", {})
-        xyxy_values = as_list(boxes.xyxy)
-        class_values = as_list(getattr(boxes, "cls", []))
-        conf_values = as_list(getattr(boxes, "conf", []))
-        detections = []
-        for index, box in enumerate(xyxy_values):
-            if len(box) < 4:
-                continue
-            class_id = int(class_values[index]) if index < len(class_values) else 0
-            confidence = float(conf_values[index]) if index < len(conf_values) else 0.0
-            detections.append(
-                {
-                    "class_id": class_id,
-                    "class_name": model_class_name(names, class_id),
-                    "confidence": confidence,
-                    "xyxy": [float(value) for value in box[:4]],
-                }
-            )
-        return detections
-
-    def _device(self) -> str:
-        if self.config.device != "auto":
-            return self.config.device
-        try:
-            import torch
-
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            return "cpu"
+        return self.predictor.detections(frame)
 
 
 def load_truths(
@@ -511,16 +468,54 @@ def render_evaluation_image(
     names: Sequence[str],
 ) -> np.ndarray:
     annotated = frame.copy()
+    height, width = annotated.shape[:2]
+    line_width = max(2, round((height + width) * 0.0012))
+    font_scale = max(0.48, min(0.78, (height + width) / 1500.0))
+    font_thickness = 2
+    label_positions: List[Tuple[int, int, int, int]] = []
+
     for truth in truths:
-        draw_box(annotated, truth["xyxy"], (40, 170, 80), f"GT {class_name(names, int(truth['class_id']))}")
+        draw_box(
+            annotated,
+            truth["xyxy"],
+            (40, 170, 80),
+            f"GT {class_name(names, int(truth['class_id']))}",
+            label_positions,
+            font_scale,
+            font_thickness,
+            line_width,
+        )
     for prediction in predictions:
         label = f"P {class_name(names, int(prediction['class_id']))} {float(prediction.get('confidence', 0.0)):.2f}"
-        draw_box(annotated, prediction["xyxy"], (35, 120, 240), label)
+        draw_box(
+            annotated,
+            prediction["xyxy"],
+            label_color(int(prediction["class_id"])),
+            label,
+            label_positions,
+            font_scale,
+            font_thickness,
+            line_width,
+        )
     return annotated
 
 
-def draw_box(image: np.ndarray, xyxy: Sequence[float], color: Tuple[int, int, int], label: str) -> None:
+def draw_box(
+    image: np.ndarray,
+    xyxy: Sequence[float],
+    color: Tuple[int, int, int],
+    label: str,
+    label_positions: List[Tuple[int, int, int, int]] | None = None,
+    font_scale: float | None = None,
+    font_thickness: int = 2,
+    line_width: int = 2,
+) -> None:
     height, width = image.shape[:2]
+    if font_scale is None:
+        font_scale = max(0.48, min(0.78, (height + width) / 1500.0))
+    if label_positions is None:
+        label_positions = []
+
     x1, y1, x2, y2 = [int(round(value)) for value in xyxy[:4]]
     x1 = max(0, min(width - 1, x1))
     x2 = max(0, min(width - 1, x2))
@@ -528,12 +523,170 @@ def draw_box(image: np.ndarray, xyxy: Sequence[float], color: Tuple[int, int, in
     y2 = max(0, min(height - 1, y2))
     if x2 <= x1 or y2 <= y1:
         return
-    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-    (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-    label_width = min(width - x1, text_width + 8)
-    y0 = y1 - text_height - baseline - 6 if y1 > text_height + 8 else y1
-    cv2.rectangle(image, (x1, y0), (x1 + label_width, y0 + text_height + baseline + 6), color, -1)
-    cv2.putText(image, label, (x1 + 4, y0 + text_height + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+
+    overlay = image.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, line_width, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.62, image, 0.38, 0, image)
+
+    label_x, label_y, label_width, label_height = find_label_position(
+        x1,
+        y1,
+        x2,
+        y2,
+        label,
+        font_scale,
+        font_thickness,
+        width,
+        height,
+        label_positions,
+    )
+    label_cx = label_x + label_width // 2
+    label_cy = label_y + label_height // 2
+    box_cx = (x1 + x2) // 2
+    box_cy = (y1 + y2) // 2
+    distance = ((label_cx - box_cx) ** 2 + (label_cy - box_cy) ** 2) ** 0.5
+    if distance > max(x2 - x1, y2 - y1) * 1.5:
+        cv2.line(image, (box_cx, box_cy), (label_cx, label_cy), color, 1, cv2.LINE_AA)
+
+    label_positions.append((label_x, label_y, label_width, label_height))
+    draw_translucent_label(image, label, label_x, label_y, color, font_scale, font_thickness)
+
+
+def find_label_position(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    label: str,
+    font_scale: float,
+    font_thickness: int,
+    image_width: int,
+    image_height: int,
+    existing_labels: List[Tuple[int, int, int, int]],
+) -> Tuple[int, int, int, int]:
+    padding_x = 4
+    padding_y = 3
+    gap = 5
+    (text_width, text_height), baseline = cv2.getTextSize(
+        label,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        font_thickness,
+    )
+    label_width = min(max(1, image_width), text_width + padding_x * 2)
+    label_height = min(max(1, image_height), text_height + baseline + padding_y * 2)
+    max_x = max(0, image_width - label_width)
+    max_y = max(0, image_height - label_height)
+
+    candidates: List[Tuple[int, int]] = []
+    for offset_x in (0, -label_width // 3, label_width // 3, -label_width // 2, label_width // 2):
+        candidates.append((x1 + offset_x, y1 - label_height - gap))
+    for offset_x in (0, -label_width // 3, label_width // 3, -label_width // 2, label_width // 2):
+        candidates.append((x1 + offset_x, y2 + gap))
+    for offset_y in (0, -label_height // 3, label_height // 3):
+        candidates.append((x1 - label_width - gap, y1 + offset_y))
+    for offset_y in (0, -label_height // 3, label_height // 3):
+        candidates.append((x2 + gap, y1 + offset_y))
+    candidates.extend(
+        [
+            (x1 + 2, y1 + 2),
+            (x2 - label_width - 2, y1 + 2),
+            (x1 + 2, y2 - label_height - 2),
+            (x2 - label_width - 2, y2 - label_height - 2),
+        ]
+    )
+
+    def clamp(candidate_x: int, candidate_y: int) -> Tuple[int, int]:
+        return max(0, min(candidate_x, max_x)), max(0, min(candidate_y, max_y))
+
+    def overlaps(candidate_x: int, candidate_y: int) -> bool:
+        for existing_x, existing_y, existing_w, existing_h in existing_labels:
+            if not (
+                candidate_x + label_width + 2 < existing_x
+                or candidate_x > existing_x + existing_w + 2
+                or candidate_y + label_height + 2 < existing_y
+                or candidate_y > existing_y + existing_h + 2
+            ):
+                return True
+        return False
+
+    for candidate_x, candidate_y in candidates:
+        checked_x, checked_y = clamp(int(candidate_x), int(candidate_y))
+        if not overlaps(checked_x, checked_y):
+            return checked_x, checked_y, label_width, label_height
+
+    center_x = (x1 + x2) // 2
+    center_y = (y1 + y2) // 2
+    for radius in range(0, max(image_width, image_height) + 20, 20):
+        for angle in range(0, 360, 45):
+            checked_x = int(center_x + radius * math.cos(math.radians(angle)) - label_width // 2)
+            checked_y = int(center_y + radius * math.sin(math.radians(angle)) - label_height // 2)
+            checked_x, checked_y = clamp(checked_x, checked_y)
+            if not overlaps(checked_x, checked_y):
+                return checked_x, checked_y, label_width, label_height
+
+    fallback_x, fallback_y = clamp(x1, y1 - label_height)
+    return fallback_x, fallback_y, label_width, label_height
+
+
+def draw_translucent_label(
+    image: np.ndarray,
+    label: str,
+    x: int,
+    y: int,
+    color: Tuple[int, int, int],
+    font_scale: float,
+    font_thickness: int,
+) -> None:
+    height, width = image.shape[:2]
+    padding_x = 4
+    padding_y = 3
+    (text_width, text_height), baseline = cv2.getTextSize(
+        label,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        font_thickness,
+    )
+    label_width = min(width, text_width + padding_x * 2)
+    label_height = min(height, text_height + baseline + padding_y * 2)
+    if label_width <= 0 or label_height <= 0:
+        return
+
+    x1 = max(0, min(x, width - label_width))
+    y1 = max(0, min(y, height - label_height))
+    x2 = min(width - 1, x1 + label_width)
+    y2 = min(height - 1, y1 + label_height)
+
+    overlay = image.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness=-1, lineType=cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.45, image, 0.55, 0, image)
+
+    text_color = (20, 20, 20) if sum(color) > 420 else (255, 255, 255)
+    text_origin = (x1 + padding_x, min(y2 - baseline, y1 + padding_y + text_height))
+    cv2.putText(
+        image,
+        label,
+        text_origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        text_color,
+        thickness=font_thickness,
+        lineType=cv2.LINE_AA,
+    )
+
+
+def label_color(class_id: int) -> Tuple[int, int, int]:
+    palette = (
+        (56, 128, 255),
+        (40, 180, 99),
+        (243, 156, 18),
+        (231, 76, 60),
+        (155, 89, 182),
+        (26, 188, 156),
+        (52, 152, 219),
+        (241, 196, 15),
+    )
+    return palette[class_id % len(palette)]
 
 
 def write_evaluation_report(report: Dict[str, Any], output_dir: Path) -> None:

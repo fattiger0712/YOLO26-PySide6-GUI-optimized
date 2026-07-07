@@ -62,6 +62,58 @@ class SavedRenderingTest(unittest.TestCase):
         self.assertEqual(rendered.shape, frame.shape)
         self.assertTrue(np.array_equal(rendered, frame))
 
+    def test_find_label_position_avoids_existing_labels(self):
+        first = DetectionWorker._find_label_position(
+            20,
+            30,
+            90,
+            90,
+            "stop 0.90",
+            0.55,
+            2,
+            160,
+            120,
+            [],
+        )
+        second = DetectionWorker._find_label_position(
+            22,
+            32,
+            92,
+            92,
+            "speed 0.80",
+            0.55,
+            2,
+            160,
+            120,
+            [first],
+        )
+
+        self.assertFalse(self._rects_overlap(first, second))
+
+    def test_render_saved_result_uses_translucent_overlays(self):
+        worker = self._worker()
+        frame = np.full((140, 180, 3), 180, dtype=np.uint8)
+        result = FakeResult(
+            FakeBoxes(
+                [[20, 40, 100, 110], [24, 42, 104, 112]],
+                [0, 1],
+                [0.91, 0.82],
+            )
+        )
+
+        rendered = worker._render_saved_result(frame, result)
+
+        self.assertEqual(rendered.shape, frame.shape)
+        self.assertFalse(np.array_equal(rendered, frame))
+        changed_pixels = np.count_nonzero(np.any(rendered != frame, axis=2))
+        self.assertGreater(changed_pixels, 100)
+
+    @staticmethod
+    def _rects_overlap(a, b):
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        return not (ax + aw + 2 < bx or ax > bx + bw + 2 or ay + ah + 2 < by or ay > by + bh + 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import sys
 import threading
 import time
 import uuid
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
-import torch
 from PySide6.QtCore import QObject, Signal, Slot
 
+from core.inference import create_predictor
 from core.models import (
     DetectionConfig,
     FrameResult,
@@ -24,11 +24,6 @@ from core.models import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LOCAL_ULTRALYTICS = PROJECT_ROOT / "ultralytics"
-if LOCAL_ULTRALYTICS.exists() and str(LOCAL_ULTRALYTICS) not in sys.path:
-    sys.path.insert(0, str(LOCAL_ULTRALYTICS))
-
-from ultralytics import YOLO  # noqa: E402
 
 
 class DetectionWorker(QObject):
@@ -52,7 +47,7 @@ class DetectionWorker(QObject):
         self.output_root = Path(output_root or PROJECT_ROOT / "outputs")
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
-        self._model = None
+        self._predictor = None
         self._writer = None
         self._run_dir = ""
 
@@ -80,7 +75,7 @@ class DetectionWorker(QObject):
                 self._run_dir = str(run_dir)
 
             self.status_changed.emit("正在加载模型...")
-            self._model = YOLO(self.config.model_path)
+            self._predictor = create_predictor(self.config)
             self.status_changed.emit("正在检测...")
 
             if self.source.kind == "batch":
@@ -99,7 +94,7 @@ class DetectionWorker(QObject):
                 if frame is None:
                     raise RuntimeError("图片读取失败，请检查文件路径。")
                 result, fps, counts, target_count = self._predict(frame)
-                annotated = result.plot()
+                annotated = self._render_saved_result(frame, result)
                 frames = 1
                 max_targets = target_count
                 final_target_count = target_count
@@ -233,7 +228,7 @@ class DetectionWorker(QObject):
                     continue
 
                 result, fps, counts, target_count = self._predict(frame)
-                annotated = result.plot()
+                annotated = self._render_saved_result(frame, result)
                 frames += 1
                 fps_sum += fps
                 final_target_count = target_count
@@ -288,7 +283,7 @@ class DetectionWorker(QObject):
                     local_frame += 1
                     frames += 1
                     result, fps, counts, target_count = self._predict(frame)
-                    annotated = result.plot()
+                    annotated = self._render_saved_result(frame, result)
                     fps_sum += fps
                     final_target_count = target_count
                     final_class_count = len(counts)
@@ -379,7 +374,7 @@ class DetectionWorker(QObject):
 
                 frames += 1
                 result, fps, counts, target_count = self._predict(frame)
-                annotated = result.plot()
+                annotated = self._render_saved_result(frame, result)
                 fps_sum += fps
                 final_target_count = target_count
                 final_class_count = len(counts)
@@ -447,27 +442,15 @@ class DetectionWorker(QObject):
         return cap
 
     def _predict(self, frame):
+        if self._predictor is None:
+            raise RuntimeError("Model predictor is not loaded.")
         start = time.perf_counter()
-        result = self._model.predict(
-            frame,
-            save=False,
-            save_txt=False,
-            imgsz=self.config.imgsz,
-            conf=self.config.conf,
-            iou=self.config.iou,
-            device=self._device(),
-            verbose=False,
-        )[0]
+        result = self._predictor.predict(frame)
         elapsed = max(time.perf_counter() - start, 1e-6)
         fps = 1.0 / elapsed
         counts = self._class_counts(result)
         target_count = sum(counts.values())
         return result, fps, counts, target_count
-
-    def _device(self) -> str:
-        if self.config.device == "auto":
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        return self.config.device
 
     def _frame_detections(self, result) -> List[Dict]:
         boxes = getattr(result, "boxes", None)
@@ -477,7 +460,7 @@ class DetectionWorker(QObject):
         xyxy_values = self._as_plain_list(boxes.xyxy)
         class_values = self._as_plain_list(getattr(boxes, "cls", []))
         conf_values = self._as_plain_list(getattr(boxes, "conf", []))
-        names = getattr(result, "names", None) or getattr(self._model, "names", {})
+        names = self._result_names(result)
 
         detections = []
         for index, box in enumerate(xyxy_values):
@@ -496,7 +479,7 @@ class DetectionWorker(QObject):
         return detections
 
     def _result_class_names(self, result) -> List[str]:
-        names = getattr(result, "names", None) or getattr(self._model, "names", {})
+        names = self._result_names(result)
         if isinstance(names, dict):
             indexed_names = []
             int_keys = []
@@ -519,12 +502,20 @@ class DetectionWorker(QObject):
         if boxes is None or getattr(boxes, "cls", None) is None:
             return {}
 
-        names = getattr(result, "names", None) or getattr(self._model, "names", {})
+        names = self._result_names(result)
         counts: Dict[str, int] = {}
-        for class_id in boxes.cls.detach().cpu().numpy().astype(int).tolist():
+        for class_id in [int(value) for value in self._as_plain_list(boxes.cls)]:
             name = self._class_name(names, class_id)
             counts[name] = counts.get(name, 0) + 1
         return counts
+
+    def _result_names(self, result):
+        names = getattr(result, "names", None)
+        if names:
+            return names
+        if self._predictor is not None:
+            return getattr(self._predictor, "names", {})
+        return {}
 
     @staticmethod
     def _class_name(names, class_id: int) -> str:
@@ -569,11 +560,13 @@ class DetectionWorker(QObject):
         if not xyxy_values:
             return annotated
 
-        names = getattr(result, "names", None) or getattr(self._model, "names", {})
+        names = self._result_names(result)
         height, width = annotated.shape[:2]
         line_width = max(1, round((height + width) * 0.0012))
-        font_scale = max(0.32, min(0.52, (height + width) / 2600.0))
-        font_thickness = 1
+        line_width = max(2, line_width)
+        font_scale = max(0.48, min(0.78, (height + width) / 1500.0))
+        font_thickness = 2
+        label_positions: List[Tuple[int, int, int, int]] = []
 
         for index, box in enumerate(xyxy_values):
             if len(box) < 4:
@@ -591,26 +584,127 @@ class DetectionWorker(QObject):
             if x2 <= x1 or y2 <= y1:
                 continue
 
+            overlay = annotated.copy()
             cv2.rectangle(
-                annotated,
+                overlay,
                 (x1, y1),
                 (x2, y2),
                 color,
                 thickness=line_width,
                 lineType=cv2.LINE_AA,
             )
+            cv2.addWeighted(overlay, 0.62, annotated, 0.38, 0, annotated)
 
             label = f"{self._class_name(names, class_id)} {confidence:.2f}"
+            label_x, label_y, label_w, label_h = self._find_label_position(
+                x1,
+                y1,
+                x2,
+                y2,
+                label,
+                font_scale,
+                font_thickness,
+                width,
+                height,
+                label_positions,
+            )
+
+            label_cx = label_x + label_w // 2
+            label_cy = label_y + label_h // 2
+            box_cx = (x1 + x2) // 2
+            box_cy = (y1 + y2) // 2
+            distance = ((label_cx - box_cx) ** 2 + (label_cy - box_cy) ** 2) ** 0.5
+            if distance > max(x2 - x1, y2 - y1) * 1.5:
+                cv2.line(annotated, (box_cx, box_cy), (label_cx, label_cy), color, 1, cv2.LINE_AA)
+
+            label_positions.append((label_x, label_y, label_w, label_h))
             self._draw_translucent_label(
                 annotated,
                 label,
-                x1,
-                y1,
+                label_x,
+                label_y,
                 color,
                 font_scale,
                 font_thickness,
             )
         return annotated
+
+    @staticmethod
+    def _find_label_position(
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        label: str,
+        font_scale: float,
+        font_thickness: int,
+        image_width: int,
+        image_height: int,
+        existing_labels: List[Tuple[int, int, int, int]],
+    ) -> Tuple[int, int, int, int]:
+        padding_x = 4
+        padding_y = 3
+        gap = 5
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            font_thickness,
+        )
+        label_width = min(max(1, image_width), text_width + padding_x * 2)
+        label_height = min(max(1, image_height), text_height + baseline + padding_y * 2)
+        max_x = max(0, image_width - label_width)
+        max_y = max(0, image_height - label_height)
+
+        candidates: List[Tuple[int, int]] = []
+        for offset_x in (0, -label_width // 3, label_width // 3, -label_width // 2, label_width // 2):
+            candidates.append((x1 + offset_x, y1 - label_height - gap))
+        for offset_x in (0, -label_width // 3, label_width // 3, -label_width // 2, label_width // 2):
+            candidates.append((x1 + offset_x, y2 + gap))
+        for offset_y in (0, -label_height // 3, label_height // 3):
+            candidates.append((x1 - label_width - gap, y1 + offset_y))
+        for offset_y in (0, -label_height // 3, label_height // 3):
+            candidates.append((x2 + gap, y1 + offset_y))
+        candidates.extend(
+            [
+                (x1 + 2, y1 + 2),
+                (x2 - label_width - 2, y1 + 2),
+                (x1 + 2, y2 - label_height - 2),
+                (x2 - label_width - 2, y2 - label_height - 2),
+            ]
+        )
+
+        def clamp(candidate_x: int, candidate_y: int) -> Tuple[int, int]:
+            return max(0, min(candidate_x, max_x)), max(0, min(candidate_y, max_y))
+
+        def overlaps(candidate_x: int, candidate_y: int) -> bool:
+            for existing_x, existing_y, existing_w, existing_h in existing_labels:
+                if not (
+                    candidate_x + label_width + 2 < existing_x
+                    or candidate_x > existing_x + existing_w + 2
+                    or candidate_y + label_height + 2 < existing_y
+                    or candidate_y > existing_y + existing_h + 2
+                ):
+                    return True
+            return False
+
+        for candidate_x, candidate_y in candidates:
+            checked_x, checked_y = clamp(int(candidate_x), int(candidate_y))
+            if not overlaps(checked_x, checked_y):
+                return checked_x, checked_y, label_width, label_height
+
+        center_x = (x1 + x2) // 2
+        center_y = (y1 + y2) // 2
+        for radius in range(0, max(image_width, image_height) + 20, 20):
+            for angle in range(0, 360, 45):
+                checked_x = int(center_x + radius * math.cos(math.radians(angle)) - label_width // 2)
+                checked_y = int(center_y + radius * math.sin(math.radians(angle)) - label_height // 2)
+                checked_x, checked_y = clamp(checked_x, checked_y)
+                if not overlaps(checked_x, checked_y):
+                    return checked_x, checked_y, label_width, label_height
+
+        fallback_x, fallback_y = clamp(x1, y1 - label_height)
+        return fallback_x, fallback_y, label_width, label_height
 
     @staticmethod
     def _draw_translucent_label(
@@ -637,8 +731,7 @@ class DetectionWorker(QObject):
             return
 
         x1 = max(0, min(x, width - label_width))
-        y1 = y - label_height if y >= label_height else y
-        y1 = max(0, min(y1, height - label_height))
+        y1 = max(0, min(y, height - label_height))
         x2 = min(width - 1, x1 + label_width)
         y2 = min(height - 1, y1 + label_height)
 
@@ -696,9 +789,9 @@ class DetectionWorker(QObject):
             label_name = f"frame_{frame_index:06d}.txt"
         label_path = Path(self._run_dir) / "labels" / label_name
 
-        classes = boxes.cls.detach().cpu().numpy().astype(int).tolist()
-        xywhn = boxes.xywhn.detach().cpu().numpy().tolist()
-        confs = boxes.conf.detach().cpu().numpy().tolist()
+        classes = [int(value) for value in self._as_plain_list(getattr(boxes, "cls", []))]
+        xywhn = self._as_plain_list(getattr(boxes, "xywhn", []))
+        confs = self._as_plain_list(getattr(boxes, "conf", []))
         with label_path.open("w", encoding="utf-8") as handle:
             for class_id, box, conf in zip(classes, xywhn, confs):
                 x, y, w, h = box
@@ -762,9 +855,9 @@ class DetectionWorker(QObject):
         with label_path.open("w", encoding="utf-8") as handle:
             if boxes is None:
                 return
-            classes = boxes.cls.detach().cpu().numpy().astype(int).tolist()
-            xywhn = boxes.xywhn.detach().cpu().numpy().tolist()
-            confs = boxes.conf.detach().cpu().numpy().tolist()
+            classes = [int(value) for value in self._as_plain_list(getattr(boxes, "cls", []))]
+            xywhn = self._as_plain_list(getattr(boxes, "xywhn", []))
+            confs = self._as_plain_list(getattr(boxes, "conf", []))
             for class_id, box, conf in zip(classes, xywhn, confs):
                 x, y, w, h = box
                 handle.write(f"{class_id} {x:.6f} {y:.6f} {w:.6f} {h:.6f} {conf:.6f}\n")

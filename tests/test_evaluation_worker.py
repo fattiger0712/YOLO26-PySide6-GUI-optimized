@@ -11,7 +11,7 @@ if find_spec("cv2") is None:
 
 import cv2
 
-from core.evaluation_worker import EvaluationConfig, box_iou, evaluate_dataset
+from core.evaluation_worker import EvaluationConfig, box_iou, evaluate_dataset, render_evaluation_image
 
 
 class EvaluationWorkerTest(unittest.TestCase):
@@ -76,6 +76,31 @@ class EvaluationWorkerTest(unittest.TestCase):
         self.assertTrue((output_dir / "failure_cases.csv").exists())
         self.assertTrue(Path(report["artifacts"]["predictions_dir"]).exists())
         self.assertTrue(Path(report["artifacts"]["errors_dir"]).exists())
+
+        prediction_images = list(Path(report["artifacts"]["predictions_dir"]).glob("*.jpg"))
+        error_images = list(Path(report["artifacts"]["errors_dir"]).rglob("*.jpg"))
+        self.assertTrue(prediction_images)
+        self.assertTrue(error_images)
+        self.assertIsNotNone(cv2.imread(str(prediction_images[0])))
+        self.assertIsNotNone(cv2.imread(str(error_images[0])))
+
+    def test_render_evaluation_image_uses_translucent_non_overlapping_style(self):
+        frame = np.full((140, 180, 3), 180, dtype=np.uint8)
+        truths = [
+            {"class_id": 0, "class_name": "stop", "xyxy": [20, 40, 100, 110], "small": False},
+            {"class_id": 1, "class_name": "speed", "xyxy": [24, 42, 104, 112], "small": False},
+        ]
+        predictions = [
+            {"class_id": 0, "class_name": "stop", "confidence": 0.91, "xyxy": [22, 42, 102, 112]},
+            {"class_id": 1, "class_name": "speed", "confidence": 0.83, "xyxy": [28, 46, 108, 116]},
+        ]
+
+        rendered = render_evaluation_image(frame, predictions, truths, ["stop", "speed"])
+
+        self.assertEqual(rendered.shape, frame.shape)
+        self.assertFalse(np.array_equal(rendered, frame))
+        changed_pixels = np.count_nonzero(np.any(rendered != frame, axis=2))
+        self.assertGreater(changed_pixels, 100)
 
 
 if __name__ == "__main__":

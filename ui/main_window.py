@@ -55,6 +55,7 @@ from core.evaluation_worker import (
     write_evaluation_report,
 )
 from core.history_store import HistoryStore
+from core.inference import SUPPORTED_MODEL_SUFFIXES
 from core.models import DetectionConfig, FrameResult, SourceSpec, iter_supported_media
 from core.review_dataset import build_labelimg_args, export_review_sample, resolve_labelimg_executable
 from core.weight_registry import WeightRegistryStore, ensure_training_run_weights
@@ -737,6 +738,7 @@ class EvaluationDialog(QDialog):
         self.failure_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.failure_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.failure_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.failure_table.cellDoubleClicked.connect(self._open_failure_prediction_image)
         layout.addWidget(self.failure_table, 1)
         return panel
 
@@ -829,8 +831,27 @@ class EvaluationDialog(QDialog):
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                item.setToolTip(str(value))
+                if col == 4:
+                    artifact_path = str(case.get("artifact_path", ""))
+                    item.setToolTip(f"双击打开预测图：\n{artifact_path}\n\n原图：\n{value}")
+                else:
+                    item.setToolTip(str(value))
                 self.failure_table.setItem(row, col, item)
+
+    def _open_failure_prediction_image(self, row: int, column: int) -> None:
+        if column != 4:
+            return
+        cases = self.report.get("failure_cases") or []
+        if row < 0 or row >= len(cases):
+            return
+        case = cases[row]
+        prediction_path = Path(str(case.get("artifact_path", "")))
+        if not prediction_path.exists():
+            prediction_path = Path(str(case.get("image_path", "")))
+        if prediction_path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(prediction_path)))
+        else:
+            QMessageBox.information(self, "预测图不存在", "找不到该失败案例对应的预测图文件。")
 
     def _record_failure_note(self) -> None:
         row = self.failure_table.currentRow()
@@ -1111,6 +1132,217 @@ class TrainLauncherDialog(QDialog):
         event.accept()
 
 
+class OnnxExportDialog(QDialog):
+    def __init__(
+        self,
+        store: WeightRegistryStore,
+        models_dir: Path,
+        default_pt_path: Path,
+        default_imgsz: int,
+        refresh_callback,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.store = store
+        self.models_dir = models_dir
+        self.refresh_callback = refresh_callback
+        self.process: Optional[QProcess] = None
+
+        self.setWindowTitle("PT -> ONNX")
+        self.resize(860, 520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(8)
+
+        self.pt_edit = QLineEdit(str(default_pt_path) if default_pt_path.exists() else "")
+        pt_btn = QPushButton("Choose")
+        pt_btn.clicked.connect(self._choose_pt)
+        form.addWidget(QLabel("PT model"), 0, 0)
+        form.addWidget(self.pt_edit, 0, 1)
+        form.addWidget(pt_btn, 0, 2)
+
+        default_output = self._default_output_path(default_pt_path)
+        self.output_edit = QLineEdit(str(default_output))
+        output_btn = QPushButton("Save as")
+        output_btn.clicked.connect(self._choose_output)
+        form.addWidget(QLabel("ONNX output"), 1, 0)
+        form.addWidget(self.output_edit, 1, 1)
+        form.addWidget(output_btn, 1, 2)
+
+        self.imgsz_spin = QSpinBox()
+        self.imgsz_spin.setRange(64, 4096)
+        self.imgsz_spin.setSingleStep(32)
+        self.imgsz_spin.setValue(default_imgsz or 1024)
+        self.opset_spin = QSpinBox()
+        self.opset_spin.setRange(11, 20)
+        self.opset_spin.setValue(14)
+        form.addWidget(QLabel("imgsz"), 2, 0)
+        form.addWidget(self.imgsz_spin, 2, 1)
+        form.addWidget(QLabel("opset"), 3, 0)
+        form.addWidget(self.opset_spin, 3, 1)
+        layout.addLayout(form)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("ONNX export log will appear here.")
+        layout.addWidget(self.log_view, 1)
+
+        bottom = QHBoxLayout()
+        self.status_label = QLabel("Ready")
+        self.status_label.setObjectName("Muted")
+        self.start_btn = QPushButton("Export ONNX")
+        self.start_btn.setObjectName("PrimaryButton")
+        self.start_btn.clicked.connect(self._start_export)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setObjectName("DangerButton")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_export)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        bottom.addWidget(self.status_label, 1)
+        bottom.addWidget(self.start_btn)
+        bottom.addWidget(self.stop_btn)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+    def _choose_pt(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "Choose PT model", str(self.models_dir), "PyTorch weights (*.pt)")
+        if not filename:
+            return
+        self.pt_edit.setText(filename)
+        self.output_edit.setText(str(self._default_output_path(Path(filename))))
+
+    def _choose_output(self) -> None:
+        current = Path(self.output_edit.text().strip() or str(self.models_dir / "model.onnx"))
+        filename, _ = QFileDialog.getSaveFileName(self, "Save ONNX model", str(current), "ONNX model (*.onnx)")
+        if filename:
+            if Path(filename).suffix.lower() != ".onnx":
+                filename += ".onnx"
+            self.output_edit.setText(filename)
+
+    def _start_export(self) -> None:
+        pt_path = Path(self.pt_edit.text().strip())
+        output_path = Path(self.output_edit.text().strip())
+        if pt_path.suffix.lower() != ".pt" or not pt_path.exists():
+            QMessageBox.warning(self, "Invalid PT model", f"Cannot find PT model: {pt_path}")
+            return
+        if output_path.suffix.lower() != ".onnx":
+            QMessageBox.warning(self, "Invalid ONNX path", "Output path must end with .onnx")
+            return
+        if output_path.exists():
+            reply = QMessageBox.question(
+                self,
+                "Overwrite ONNX",
+                f"Overwrite existing ONNX file?\n\n{output_path}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        code = self._build_export_code(pt_path, output_path)
+        self.process = QProcess(self)
+        self.process.setWorkingDirectory(str(PROJECT_ROOT))
+        self.process.readyReadStandardOutput.connect(self._read_stdout)
+        self.process.readyReadStandardError.connect(self._read_stderr)
+        self.process.finished.connect(lambda exit_code, status: self._on_finished(exit_code, status, pt_path, output_path))
+        self.process.start(sys.executable, ["-c", code])
+        if not self.process.waitForStarted(3000):
+            QMessageBox.warning(self, "Export failed to start", self.process.errorString())
+            self.process = None
+            return
+
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.status_label.setText("Exporting...")
+        self.log_view.appendPlainText("ONNX export started.")
+
+    def _build_export_code(self, pt_path: Path, output_path: Path) -> str:
+        values = {
+            "local_ultralytics": str(LOCAL_ULTRALYTICS),
+            "pt": str(pt_path),
+            "output": str(output_path),
+            "imgsz": self.imgsz_spin.value(),
+            "opset": self.opset_spin.value(),
+        }
+        return (
+            "import json, shutil, sys\n"
+            "from pathlib import Path\n"
+            f"sys.path.insert(0, {json.dumps(values['local_ultralytics'], ensure_ascii=False)})\n"
+            "from ultralytics import YOLO\n"
+            f"pt_path = Path({json.dumps(values['pt'], ensure_ascii=False)})\n"
+            f"output_path = Path({json.dumps(values['output'], ensure_ascii=False)})\n"
+            "output_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "model = YOLO(str(pt_path))\n"
+            "print('ONNX_EXPORT_STARTED')\n"
+            "exported = Path(model.export("
+            "format='onnx', "
+            f"imgsz={values['imgsz']}, "
+            f"opset={values['opset']}, "
+            "dynamic=False, simplify=False))\n"
+            "if exported.resolve() != output_path.resolve():\n"
+            "    shutil.copy2(exported, output_path)\n"
+            "print(f'EXPORTED_ONNX={output_path}')\n"
+        )
+
+    def _read_stdout(self) -> None:
+        if not self.process:
+            return
+        text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if text:
+            self.log_view.appendPlainText(text.rstrip())
+
+    def _read_stderr(self) -> None:
+        if not self.process:
+            return
+        text = bytes(self.process.readAllStandardError()).decode("utf-8", errors="replace")
+        if text:
+            self.log_view.appendPlainText(text.rstrip())
+
+    def _stop_export(self) -> None:
+        if self.process and self.process.state() != QProcess.NotRunning:
+            self.process.terminate()
+            self.status_label.setText("Stopping...")
+            self.stop_btn.setEnabled(False)
+
+    def _on_finished(self, exit_code: int, _status, pt_path: Path, output_path: Path) -> None:
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText(f"Finished, exit code: {exit_code}")
+        if exit_code == 0 and output_path.exists():
+            try:
+                record = self.store.register_exported_onnx(
+                    output_path,
+                    pt_path,
+                    self.imgsz_spin.value(),
+                    self.opset_spin.value(),
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Register ONNX failed", str(exc))
+            else:
+                self.refresh_callback(record.get("model_name", ""))
+                self.status_label.setText(f"Exported: {record.get('model_name', '')}")
+                QMessageBox.information(self, "ONNX export complete", f"Exported ONNX model:\n{output_path}")
+        self.process = None
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.process and self.process.state() != QProcess.NotRunning:
+            self.process.terminate()
+            self.process.waitForFinished(3000)
+        event.accept()
+
+    def _default_output_path(self, pt_path: Path) -> Path:
+        if pt_path.exists():
+            return self.models_dir / f"{pt_path.stem}.onnx"
+        return self.models_dir / "model.onnx"
+
+
 class WeightManagerDialog(QDialog):
     IMAGE_FIELDS = [
         ("训练曲线", "results_png"),
@@ -1128,6 +1360,7 @@ class WeightManagerDialog(QDialog):
         models_dir: Path,
         project_root: Path,
         apply_callback,
+        export_callback=None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -1135,6 +1368,7 @@ class WeightManagerDialog(QDialog):
         self.models_dir = models_dir
         self.project_root = project_root
         self.apply_callback = apply_callback
+        self.export_callback = export_callback
         self.records: List[Dict] = []
         self._artifact_widgets: Dict[str, ArtifactPreview] = {}
         self._detail_labels: Dict[str, QLabel] = {}
@@ -1198,11 +1432,14 @@ class WeightManagerDialog(QDialog):
         apply_btn = QPushButton("应用为当前权重")
         apply_btn.setObjectName("PrimaryButton")
         apply_btn.clicked.connect(self._apply_selected_weight)
+        export_btn = QPushButton("PT -> ONNX")
+        export_btn.clicked.connect(self._export_selected_onnx)
         open_btn = QPushButton("打开训练目录")
         open_btn.clicked.connect(self._open_training_dir)
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
         row_two.addWidget(apply_btn)
+        row_two.addWidget(export_btn)
         row_two.addWidget(open_btn)
         row_two.addStretch(1)
         row_two.addWidget(close_btn)
@@ -1277,7 +1514,9 @@ class WeightManagerDialog(QDialog):
         hidden_models = self.store.hidden_model_names()
         records_by_model = {record.get("model_name"): dict(record) for record in self.store.load()}
         self.models_dir.mkdir(exist_ok=True)
-        for model_path in sorted(self.models_dir.glob("*.pt"), key=lambda path: path.name.lower()):
+        for model_path in sorted(self.models_dir.iterdir(), key=lambda path: path.name.lower()):
+            if not model_path.is_file() or model_path.suffix.lower() not in SUPPORTED_MODEL_SUFFIXES:
+                continue
             if model_path.name in hidden_models:
                 continue
             if model_path.name not in records_by_model:
@@ -1294,6 +1533,7 @@ class WeightManagerDialog(QDialog):
                     "recommended_for": "",
                     "tags": "",
                     "notes": "",
+                    "model_format": model_path.suffix.lower().lstrip("."),
                 }
 
         self.records = sorted(
@@ -1459,6 +1699,21 @@ class WeightManagerDialog(QDialog):
         self.apply_callback(model_name)
         QMessageBox.information(self, "已应用", f"当前检测权重已切换为：{model_name}")
 
+    def _export_selected_onnx(self) -> None:
+        record = self._current_record()
+        model_name = str(record.get("model_name", ""))
+        if not model_name:
+            return
+        model_path = Path(str(record.get("model_path") or self.models_dir / model_name))
+        if not model_path.exists() and (self.models_dir / model_name).exists():
+            model_path = self.models_dir / model_name
+        if model_path.suffix.lower() != ".pt" or not model_path.exists():
+            QMessageBox.information(self, "PT required", "Please select an existing .pt model before exporting ONNX.")
+            return
+        if self.export_callback:
+            self.export_callback(model_path, self._record_imgsz(record))
+            self._refresh_records(model_name)
+
     def _open_training_dir(self) -> None:
         record = self._current_record()
         training_dir = str(record.get("training_dir", ""))
@@ -1480,6 +1735,17 @@ class WeightManagerDialog(QDialog):
             return f"{float(value):.4f}"
         except (TypeError, ValueError):
             return "--"
+
+    @staticmethod
+    def _record_imgsz(record: Dict) -> int:
+        for key in ("export_imgsz", "imgsz"):
+            try:
+                value = int(float(record.get(key) or 0))
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        return 1024
 
 
 class MainWindow(QMainWindow):
@@ -1561,9 +1827,12 @@ class MainWindow(QMainWindow):
         self.evaluation_btn.clicked.connect(self._open_evaluation_dialog)
         self.train_btn = QPushButton("训练启动")
         self.train_btn.clicked.connect(self._open_train_dialog)
+        self.onnx_export_btn = QPushButton("PT -> ONNX")
+        self.onnx_export_btn.clicked.connect(self._open_onnx_export_dialog)
         row.addWidget(self.dataset_check_btn)
         row.addWidget(self.evaluation_btn)
         row.addWidget(self.train_btn)
+        row.addWidget(self.onnx_export_btn)
         row.addWidget(self.open_outputs_btn)
         row.addWidget(self.open_csv_btn)
         return frame
@@ -1844,26 +2113,61 @@ class MainWindow(QMainWindow):
             return local_path
         return None
 
+    def _current_pt_model_path(self) -> Optional[Path]:
+        model_path = self._current_model_path()
+        if model_path is None:
+            return None
+        if model_path.suffix.lower() == ".pt":
+            return model_path
+
+        record = self.weight_store.get_by_model_name(model_path.name) or {}
+        source_path = Path(str(record.get("source_model_path", "")))
+        if source_path.suffix.lower() == ".pt" and source_path.exists():
+            return source_path
+        return None
+
+    @staticmethod
+    def _record_imgsz(record: Dict) -> int:
+        for key in ("export_imgsz", "imgsz"):
+            try:
+                value = int(float(record.get(key) or 0))
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        return 1024
+
     def _load_models(self) -> None:
         MODELS_DIR.mkdir(exist_ok=True)
         current_model = self.model_combo.currentText() if hasattr(self, "model_combo") else ""
         hidden_models = self.weight_store.hidden_model_names()
+        model_names: Dict[str, Path] = {}
+        for path in MODELS_DIR.iterdir():
+            if path.is_file() and path.suffix.lower() in SUPPORTED_MODEL_SUFFIXES and path.name not in hidden_models:
+                model_names[path.name] = path
+        for record in self.weight_store.load():
+            model_name = str(record.get("model_name", ""))
+            model_path = Path(str(record.get("model_path", "")))
+            if (
+                model_name
+                and model_name not in hidden_models
+                and model_path.exists()
+                and model_path.suffix.lower() in SUPPORTED_MODEL_SUFFIXES
+            ):
+                model_names[model_name] = model_path
         models = sorted(
-            [
-                path
-                for path in MODELS_DIR.iterdir()
-                if path.suffix.lower() == ".pt" and path.name not in hidden_models
-            ],
-            key=lambda path: path.stat().st_size,
+            model_names.items(),
+            key=lambda item: (0 if item[1].suffix.lower() == ".pt" else 1, item[1].stat().st_size, item[0].lower()),
         )
         self.model_combo.clear()
-        self.model_combo.addItems([path.name for path in models])
+        self.model_combo.addItems([name for name, _path in models])
         if models:
-            selected = current_model if current_model in [path.name for path in models] else models[0].name
+            model_name_list = [name for name, _path in models]
+            selected = current_model if current_model in model_name_list else model_name_list[0]
             self._select_model_by_name(selected)
         else:
             self.model_card_value.setText("未找到")
-            self._set_status("models 目录下没有 .pt 权重文件")
+            self._set_status("models directory has no .pt or .onnx model files")
 
     def _select_model_by_name(self, model_name: str) -> None:
         index = self.model_combo.findText(model_name)
@@ -1977,7 +2281,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "请选择来源", "请先选择图片、视频、摄像头或 HTTP/RTSP。")
             return
         if self.model_combo.count() == 0:
-            QMessageBox.warning(self, "没有模型", "请将 .pt 权重文件放入 models 目录。")
+            QMessageBox.warning(self, "没有模型", "请将 .pt 或 .onnx 模型文件放入 models 目录。")
             return
 
         self._reset_preview()
@@ -2042,7 +2346,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _open_train_dialog(self) -> None:
-        model_path = self._current_model_path() or Path("__missing_model__.pt")
+        model_path = self._current_pt_model_path() or Path("__missing_model__.pt")
         dialog = TrainLauncherDialog(
             self.weight_store,
             MODELS_DIR,
@@ -2051,6 +2355,32 @@ class MainWindow(QMainWindow):
             self,
         )
         dialog.exec()
+
+    def _open_onnx_export_dialog(self, model_path=None, default_imgsz: int | None = None) -> None:
+        if not isinstance(model_path, (str, Path)):
+            model_path = None
+        pt_path = Path(model_path) if model_path else self._current_pt_model_path()
+        if pt_path is None or pt_path.suffix.lower() != ".pt" or not pt_path.exists():
+            QMessageBox.information(self, "PT required", "Please select an existing .pt model before exporting ONNX.")
+            return
+
+        record = self.weight_store.get_by_model_name(pt_path.name) or {}
+        imgsz = default_imgsz or self._record_imgsz(record)
+        dialog = OnnxExportDialog(
+            self.weight_store,
+            MODELS_DIR,
+            pt_path,
+            imgsz,
+            self._on_onnx_exported,
+            self,
+        )
+        dialog.exec()
+
+    def _on_onnx_exported(self, model_name: str) -> None:
+        self._load_models()
+        if model_name:
+            self._select_model_by_name(model_name)
+        self._set_status(f"ONNX exported: {model_name}")
 
     def _on_training_weight_imported(self, model_name: str) -> None:
         self._load_models()
@@ -2064,6 +2394,7 @@ class MainWindow(QMainWindow):
             MODELS_DIR,
             PROJECT_ROOT,
             self._apply_model_from_manager,
+            self._open_onnx_export_dialog,
             self,
         )
         dialog.exec()
@@ -2298,6 +2629,7 @@ class MainWindow(QMainWindow):
             self.stream_btn,
             self.model_combo,
             self.weight_manager_btn,
+            self.onnx_export_btn,
             self.save_result_check,
             self.save_txt_check,
         ):
@@ -2317,6 +2649,7 @@ class MainWindow(QMainWindow):
             self.stream_btn,
             self.model_combo,
             self.weight_manager_btn,
+            self.onnx_export_btn,
             self.save_result_check,
             self.save_txt_check,
         ):

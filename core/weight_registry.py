@@ -14,6 +14,7 @@ RECALL_KEY = "metrics/recall(B)"
 MAP50_KEY = "metrics/mAP50(B)"
 MAP5095_KEY = "metrics/mAP50-95(B)"
 MANUAL_FIELDS = ("display_name", "recommended_for", "tags", "notes")
+MODEL_SUFFIXES = {".pt", ".onnx"}
 
 
 @dataclass
@@ -70,6 +71,11 @@ class WeightTrainingRecord:
     updated_at: str = ""
     file_size: int = 0
     modified_at: str = ""
+    model_format: str = "pt"
+    source_model_path: str = ""
+    export_imgsz: int = 0
+    export_opset: int = 0
+    exported_at: str = ""
     metrics: Dict[str, Any] = field(default_factory=dict)
     artifacts: Dict[str, Any] = field(default_factory=dict)
     recommended_for: str = ""
@@ -180,6 +186,71 @@ class WeightRegistryStore:
             record.imported_at = str(existing.get("imported_at") or record.imported_at)
         return self.upsert(record)
 
+    def register_exported_onnx(
+        self,
+        onnx_path: str | Path,
+        source_model_path: str | Path = "",
+        imgsz: int = 0,
+        opset: int = 0,
+    ) -> Dict[str, Any]:
+        model = Path(onnx_path)
+        if model.suffix.lower() != ".onnx":
+            raise ValueError(f"Expected an ONNX file: {model}")
+        if not model.exists():
+            raise ValueError(f"ONNX file does not exist: {model}")
+
+        source = Path(source_model_path) if source_model_path else None
+        source_record = self.get_by_model_name(source.name) if source and source.name else None
+        existing = self.get_by_model_name(model.name)
+        stat = model.stat()
+        now = _now_text()
+
+        data: Dict[str, Any] = {}
+        if source_record:
+            for key in (
+                "training_name",
+                "training_dir",
+                "dataset",
+                "base_model",
+                "task",
+                "epochs",
+                "imgsz",
+                "batch",
+                "device",
+                "metrics",
+                "artifacts",
+                "recommended_for",
+                "tags",
+                "notes",
+            ):
+                if key in source_record:
+                    data[key] = source_record[key]
+
+        data.update(
+            {
+                "model_name": model.name,
+                "model_path": _path_text(model),
+                "display_name": (existing or {}).get("display_name") or model.stem,
+                "imgsz": str(imgsz or data.get("imgsz", "")),
+                "imported_at": str((existing or {}).get("imported_at") or now),
+                "file_size": int(stat.st_size),
+                "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "model_format": "onnx",
+                "source_model_path": _path_text(source) if source else "",
+                "source_model_name": source.name if source else "",
+                "export_imgsz": int(imgsz or 0),
+                "export_opset": int(opset or 0),
+                "exported_at": str((existing or {}).get("exported_at") or now),
+            }
+        )
+        data.setdefault("metrics", {})
+        data.setdefault("artifacts", {})
+        if existing:
+            for field_name in MANUAL_FIELDS:
+                if existing.get(field_name):
+                    data[field_name] = str(existing[field_name])
+        return self.upsert(data)
+
     def refresh(self, model_name: str) -> Dict[str, Any]:
         existing = self.get_by_model_name(model_name)
         if not existing:
@@ -229,6 +300,7 @@ def build_training_record(run_dir: str | Path, model_path: str | Path) -> Weight
         updated_at=now,
         file_size=int(stat.st_size) if stat else 0,
         modified_at=datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S") if stat else "",
+        model_format="pt",
         metrics=metrics.to_dict(),
         artifacts=artifacts.to_dict(),
     )

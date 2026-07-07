@@ -2,3 +2,5 @@ PySide6>=6.5
 opencv-python>=4.8
 torch>=2.0
 numpy>=1.23
+onnx==1.16.2
+onnxruntime==1.19.2
