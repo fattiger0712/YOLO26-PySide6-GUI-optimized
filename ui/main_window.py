@@ -110,7 +110,7 @@ class ImageLabel(QLabel):
         self._zoom_callback = None
         self.setObjectName("ImageView")
         self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(QSize(360, 260))
+        self.setMinimumSize(QSize(240, 180))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setScaledContents(False)
         self.setCursor(Qt.ArrowCursor)
@@ -471,6 +471,7 @@ class DatasetCheckDialog(QDialog):
         layout.setSpacing(8)
         layout.addWidget(QLabel("异常文件列表"))
         self.issue_table = QTableWidget(0, 3)
+        self.issue_table.setAlternatingRowColors(True)
         self.issue_table.setHorizontalHeaderLabels(["类型", "路径", "详情"])
         self.issue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.issue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -732,6 +733,7 @@ class EvaluationDialog(QDialog):
         layout.setSpacing(8)
         layout.addWidget(QLabel("失败案例"))
         self.failure_table = QTableWidget(0, 6)
+        self.failure_table.setAlternatingRowColors(True)
         self.failure_table.setHorizontalHeaderLabels(["编号", "类型", "场景", "原因", "图片", "详情"])
         self.failure_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.failure_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1396,6 +1398,7 @@ class WeightManagerDialog(QDialog):
         layout.setSpacing(8)
 
         self.weight_table = QTableWidget(0, 8)
+        self.weight_table.setAlternatingRowColors(True)
         self.weight_table.setHorizontalHeaderLabels(
             ["权重", "训练名", "数据集", "mAP50", "mAP50-95", "Precision", "Recall", "推荐用途"]
         )
@@ -1753,7 +1756,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("YOLO26 检测工作台")
         self.resize(1320, 820)
-        self.setMinimumSize(QSize(1120, 720))
+        self.setMinimumSize(QSize(900, 620))
         self.setStyleSheet(APP_QSS)
 
         self.history_store = HistoryStore(OUTPUT_DIR)
@@ -1790,16 +1793,83 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._build_top_bar())
 
-        main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.setChildrenCollapsible(False)
-        main_splitter.addWidget(self._build_left_panel())
-        main_splitter.addWidget(self._build_preview_panel())
-        main_splitter.addWidget(self._build_right_panel())
-        main_splitter.setSizes([250, 760, 280])
-        layout.addWidget(main_splitter, 1)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.left_panel = self._build_left_panel()
+        self.preview_panel = self._build_preview_panel()
+        self.right_panel = self._build_right_panel()
+        self.main_splitter.addWidget(self.left_panel)
+        self.main_splitter.addWidget(self.preview_panel)
+        self.main_splitter.addWidget(self.right_panel)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
+        self.main_splitter.setSizes([250, 760, 280])
+        layout.addWidget(self.main_splitter, 1)
 
-        layout.addWidget(self._build_history_panel())
+        self.history_panel = self._build_history_panel()
+        layout.addWidget(self.history_panel)
         layout.addWidget(self._build_status_bar())
+        self._apply_responsive_layout(self.width())
+
+    def _arrange_top_actions(self, columns: int) -> None:
+        if not hasattr(self, "top_action_grid"):
+            return
+        columns = max(1, columns)
+        if getattr(self, "_top_action_columns", None) == columns:
+            return
+        self._top_action_columns = columns
+        while self.top_action_grid.count():
+            self.top_action_grid.takeAt(0)
+        for index, button in enumerate(getattr(self, "top_action_buttons", [])):
+            self.top_action_grid.addWidget(button, index // columns, index % columns)
+
+    def _arrange_metric_cards(self, columns: int) -> None:
+        if not hasattr(self, "metrics_layout"):
+            return
+        columns = max(1, columns)
+        if getattr(self, "_metric_columns", None) == columns:
+            return
+        self._metric_columns = columns
+        while self.metrics_layout.count():
+            self.metrics_layout.takeAt(0)
+        for index, card in enumerate(getattr(self, "metric_cards", [])):
+            self.metrics_layout.addWidget(card, index // columns, index % columns)
+        for column in range(4):
+            self.metrics_layout.setColumnStretch(column, 1 if column < columns else 0)
+
+    def _apply_responsive_layout(self, width: int | None = None) -> None:
+        if not hasattr(self, "main_splitter"):
+            return
+        width = width or self.width()
+        action_columns = 6 if width >= 1500 else 3 if width >= 1120 else 2
+        metric_columns = 4 if width >= 1260 else 2
+        image_orientation = Qt.Horizontal if width >= 1160 else Qt.Vertical
+        if width < 1080:
+            splitter_sizes = [210, 470, 220]
+            history_height = 130
+        elif width < 1380:
+            splitter_sizes = [235, 650, 260]
+            history_height = 150
+        else:
+            splitter_sizes = [270, 840, 300]
+            history_height = 170
+
+        self._arrange_top_actions(action_columns)
+        self._arrange_metric_cards(metric_columns)
+
+        if hasattr(self, "image_splitter") and self.image_splitter.orientation() != image_orientation:
+            self.image_splitter.setOrientation(image_orientation)
+            self.image_splitter.setSizes([1, 1])
+
+        state = (action_columns, metric_columns, image_orientation, tuple(splitter_sizes), history_height)
+        if getattr(self, "_responsive_state", None) == state:
+            return
+        self._responsive_state = state
+        if hasattr(self, "main_splitter"):
+            self.main_splitter.setSizes(splitter_sizes)
+        if hasattr(self, "history_panel"):
+            self.history_panel.setMinimumHeight(history_height)
 
     def _build_top_bar(self) -> QFrame:
         frame = QFrame()
@@ -1811,37 +1881,55 @@ class MainWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("YOLO26 检测工作台")
         title.setObjectName("AppTitle")
+        title.setWordWrap(True)
         subtitle = QLabel("本地文件、摄像头和 HTTP/RTSP 统一后台推理")
         subtitle.setObjectName("SubTitle")
+        subtitle.setWordWrap(True)
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         row.addLayout(title_box, 1)
 
+        self.top_action_grid = QGridLayout()
+        self.top_action_grid.setHorizontalSpacing(8)
+        self.top_action_grid.setVerticalSpacing(8)
+        row.addLayout(self.top_action_grid)
+
         self.open_outputs_btn = QPushButton("打开输出目录")
         self.open_outputs_btn.clicked.connect(self._open_outputs_dir)
+        self.open_outputs_btn.setProperty("tone", "blue")
         self.open_csv_btn = QPushButton("打开CSV历史")
         self.open_csv_btn.clicked.connect(self._open_history_csv)
+        self.open_csv_btn.setProperty("tone", "blue")
         self.dataset_check_btn = QPushButton("数据集检查")
         self.dataset_check_btn.clicked.connect(self._open_dataset_checker)
+        self.dataset_check_btn.setProperty("tone", "teal")
         self.evaluation_btn = QPushButton("评测集评估")
         self.evaluation_btn.clicked.connect(self._open_evaluation_dialog)
+        self.evaluation_btn.setProperty("tone", "amber")
         self.train_btn = QPushButton("训练启动")
         self.train_btn.clicked.connect(self._open_train_dialog)
+        self.train_btn.setProperty("tone", "coral")
         self.onnx_export_btn = QPushButton("PT -> ONNX")
         self.onnx_export_btn.clicked.connect(self._open_onnx_export_dialog)
-        row.addWidget(self.dataset_check_btn)
-        row.addWidget(self.evaluation_btn)
-        row.addWidget(self.train_btn)
-        row.addWidget(self.onnx_export_btn)
-        row.addWidget(self.open_outputs_btn)
-        row.addWidget(self.open_csv_btn)
+        self.onnx_export_btn.setProperty("tone", "teal")
+        self.top_action_buttons = [
+            self.dataset_check_btn,
+            self.evaluation_btn,
+            self.train_btn,
+            self.onnx_export_btn,
+            self.open_outputs_btn,
+            self.open_csv_btn,
+        ]
+        for button in self.top_action_buttons:
+            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self._arrange_top_actions(6)
         return frame
 
     def _build_left_panel(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("Panel")
-        frame.setMinimumWidth(230)
-        frame.setMaximumWidth(300)
+        frame.setMinimumWidth(200)
+        frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -1905,13 +1993,23 @@ class MainWindow(QMainWindow):
         self.target_card_value = QLabel("--")
         self.fps_card_value = QLabel("--")
         self.model_card_value = QLabel("--")
+        for value_label, accent in (
+            (self.class_card_value, "blue"),
+            (self.target_card_value, "teal"),
+            (self.fps_card_value, "amber"),
+            (self.model_card_value, "coral"),
+        ):
+            value_label.setProperty("accent", accent)
         metrics.addWidget(self._metric_card("类别数", self.class_card_value), 0, 0)
         metrics.addWidget(self._metric_card("目标数", self.target_card_value), 0, 1)
         metrics.addWidget(self._metric_card("FPS", self.fps_card_value), 0, 2)
         metrics.addWidget(self._metric_card("当前模型", self.model_card_value), 0, 3)
+        self.metrics_layout = metrics
+        self.metric_cards = [metrics.itemAtPosition(0, column).widget() for column in range(4)]
         layout.addLayout(metrics)
 
         image_row = QSplitter(Qt.Horizontal)
+        self.image_splitter = image_row
         image_row.setChildrenCollapsible(False)
         self.raw_view = ImageLabel("原始画面")
         self.result_view = ImageLabel("检测结果")
@@ -1951,8 +2049,8 @@ class MainWindow(QMainWindow):
     def _build_right_panel(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("Panel")
-        frame.setMinimumWidth(260)
-        frame.setMaximumWidth(340)
+        frame.setMinimumWidth(220)
+        frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -2023,6 +2121,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(header)
 
         self.history_table = QTableWidget(0, 8)
+        self.history_table.setAlternatingRowColors(True)
         self.history_table.setHorizontalHeaderLabels(
             ["时间", "来源", "模型", "帧数", "平均FPS", "目标累计", "状态", "输出目录"]
         )
@@ -2057,11 +2156,14 @@ class MainWindow(QMainWindow):
     def _metric_card(title: str, value_label: QLabel) -> QFrame:
         frame = QFrame()
         frame.setObjectName("MetricCard")
+        accent = value_label.property("accent") or "blue"
+        frame.setProperty("accent", accent)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(12, 10, 12, 10)
         title_label = QLabel(title)
         title_label.setObjectName("Muted")
         value_label.setObjectName("MetricValue")
+        value_label.setProperty("accent", accent)
         value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         value_label.setWordWrap(True)
         layout.addWidget(title_label)
@@ -2764,6 +2866,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._apply_responsive_layout(event.size().width())
         if self._last_raw is not None:
             self._show_image(self.raw_view, self._last_raw)
         if self._last_annotated is not None:
